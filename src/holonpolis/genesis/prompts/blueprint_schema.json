@@ -1,0 +1,89 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Blueprint",
+  "description": "DNA for creating a new Holon",
+  "type": "object",
+  "required": ["holon_id", "species_id", "name", "purpose", "boundary", "evolution_policy"],
+  "properties": {
+    "holon_id": {
+      "type": "string",
+      "description": "Unique identifier for the new Holon"
+    },
+    "species_id": {
+      "type": "string",
+      "enum": ["generalist", "specialist", "worker", "analyst"],
+      "description": "Species archetype"
+    },
+    "name": {
+      "type": "string",
+      "description": "Display name for the Holon"
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Why this Holon is being created (will be embedded for routing)"
+    },
+    "boundary": {
+      "type": "object",
+      "required": ["allowed_tools", "max_episodes_per_hour", "max_tokens_per_episode"],
+      "properties": {
+        "allowed_tools": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "List of tool names this Holon can use"
+        },
+        "denied_tools": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Explicitly forbidden tools"
+        },
+        "max_episodes_per_hour": {
+          "type": "integer",
+          "default": 100
+        },
+        "max_tokens_per_episode": {
+          "type": "integer",
+          "default": 10000
+        },
+        "allow_file_write": {
+          "type": "boolean",
+          "default": false
+        },
+        "allow_network": {
+          "type": "boolean",
+          "default": false
+        },
+        "allow_subprocess": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "evolution_policy": {
+      "type": "object",
+      "properties": {
+        "strategy": {
+          "type": "string",
+          "enum": ["conservative", "balanced", "aggressive"],
+          "default": "balanced"
+        },
+        "auto_promote_to_global": {
+          "type": "boolean",
+          "default": false
+        },
+        "require_tests": {
+          "type": "boolean",
+          "default": true
+        },
+        "max_evolution_attempts": {
+          "type": "integer",
+          "default": 3
+        }
+      }
+    },
+    "initial_memory_tags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Tags to apply to initial memories"
+    }
+  }
+}

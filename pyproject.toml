@@ -1,0 +1,42 @@
+[project]
+name = "holonpolis"
+version = "0.1.0"
+description = "HolonPolis / HarborPilot2 Evolution Engine"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.109.0",
+    "uvicorn[standard]>=0.27.0",
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.1.0",
+    "lancedb>=0.5.0",
+    "pyarrow>=14.0.0",
+    "numpy>=1.24.0",
+    "openai>=1.10.0",
+    "pytest>=7.4.0",
+    "structlog>=24.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest-asyncio>=0.21.0",
+    "httpx>=0.26.0",
+    "black>=24.0.0",
+    "ruff>=0.2.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
