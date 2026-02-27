@@ -43,12 +43,46 @@ class LanceDBConnection:
                 raise
         return self._tables[name]
 
-    def create_table(self, name: str, schema, exist_ok: bool = True):
-        """Create a table with the given schema."""
+    def create_table(
+        self,
+        name: str,
+        schema,
+        exist_ok: bool = True,
+        enable_fts: bool = False,
+        fts_columns: Optional[list] = None,
+    ):
+        """Create a table with the given schema.
+
+        Args:
+            name: 表名
+            schema: PyArrow schema
+            exist_ok: 如果表已存在是否忽略
+            enable_fts: 是否启用全文搜索 (Full-Text Search)
+            fts_columns: 要建立 FTS 索引的列名列表
+        """
         try:
             table = self.connection.create_table(name, schema=schema, exist_ok=exist_ok)
             self._tables[name] = table
-            logger.debug("table_created", table=name, path=str(self.db_path))
+
+            # 创建 FTS 索引
+            if enable_fts and fts_columns:
+                try:
+                    # 检查是否已有 FTS 索引
+                    existing_indices = table.list_indices() if hasattr(table, "list_indices") else []
+                    has_fts = any(
+                        hasattr(idx, "index_type") and idx.index_type == "FTS"
+                        for idx in existing_indices
+                    )
+
+                    if not has_fts:
+                        # LanceDB FTS API: 使用字段名列表
+                        table.create_fts_index(fts_columns)
+                        logger.debug("fts_index_created", table=name, columns=fts_columns)
+                except Exception as e:
+                    # FTS 索引创建失败不阻塞表创建
+                    logger.warning("fts_index_creation_failed", table=name, error=str(e))
+
+            logger.debug("table_created", table=name, path=str(self.db_path), fts=enable_fts)
             return table
         except Exception as e:
             if "already exists" in str(e).lower() and exist_ok:
@@ -142,22 +176,24 @@ class LanceDBFactory:
         """Initialize standard tables for a holon.
 
         Creates:
-        - memories: Retrievable condensed memories
+        - memories: Retrievable condensed memories (with FTS index)
         - episodes: Full interaction records
         """
         conn = self.open(holon_id)
 
-        # Create memories table
+        # Create memories table with FTS 索引
         conn.create_table(
             "memories",
             build_memories_schema(self.embedding_dimension),
             exist_ok=True,
+            enable_fts=True,
+            fts_columns=["content"],  # 对 content 字段建立 FTS 索引
         )
 
         # Create episodes table
         conn.create_table("episodes", EPISODES_SCHEMA, exist_ok=True)
 
-        logger.info("holon_tables_initialized", holon_id=holon_id)
+        logger.info("holon_tables_initialized", holon_id=holon_id, fts_enabled=True)
 
     def init_genesis_tables(self) -> None:
         """Initialize Genesis-specific tables.

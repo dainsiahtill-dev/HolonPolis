@@ -29,4 +29,7 @@ BOUNDARY RULES:
 - subprocess: Only true for code execution tasks (rarely granted)
 
 OUTPUT FORMAT:
-Always return valid JSON matching the requested schema.
+- Return ONLY valid JSON matching the requested schema
+- NO thinking tags, NO explanations, NO markdown outside JSON
+- NO <think> blocks or reasoning - output JSON directly
+- If you need to reason, do it silently, then output ONLY the JSON decision

@@ -1,0 +1,616 @@
+"""Phase 4 Tests: RGV Crucible - 演化裁判所测试
+
+验证:
+1. Red 阶段: 测试代码语法检查
+2. Green 阶段: Sandbox 中运行 pytest
+3. Verify 阶段: AST 安全扫描
+4. Persist 阶段: 落盘到 skills_local
+"""
+
+import tempfile
+from pathlib import Path
+
+import pytest
+
+from holonpolis.domain.skills import ToolSchema
+from holonpolis.kernel.embeddings.default_embedder import set_embedder, SimpleEmbedder
+from holonpolis.kernel.lancedb import get_lancedb_factory, reset_factory
+from holonpolis.kernel.storage import HolonPathGuard
+from holonpolis.services.evolution_service import (
+    Attestation,
+    EvolutionResult,
+    EvolutionService,
+    SecurityScanner,
+)
+
+
+@pytest.fixture
+def temp_embedder():
+    """使用 SimpleEmbedder 避免 API 调用."""
+    embedder = SimpleEmbedder(dimension=128)
+    set_embedder(embedder)
+    return embedder
+
+
+@pytest.fixture
+def evolution_setup(tmp_path, temp_embedder, monkeypatch):
+    """设置演化测试环境."""
+    holonpolis_root = tmp_path / ".holonpolis"
+    monkeypatch.setattr(
+        "holonpolis.config.settings.holonpolis_root",
+        holonpolis_root
+    )
+    monkeypatch.setattr(
+        "holonpolis.config.settings.holons_path",
+        holonpolis_root / "holons"
+    )
+    reset_factory()
+
+    return tmp_path
+
+
+class TestSecurityScanner:
+    """AST 安全扫描测试."""
+
+    @pytest.fixture
+    def scanner(self):
+        """创建 SecurityScanner 实例."""
+        return SecurityScanner()
+
+    def test_safe_code_passes(self, scanner):
+        """测试安全代码通过扫描."""
+        code = '''
+def add(a, b):
+    """Add two numbers."""
+    return a + b
+
+class Calculator:
+    def multiply(self, x, y):
+        return x * y
+'''
+        result = scanner.scan(code)
+
+        assert result["passed"] is True
+        assert len(result["violations"]) == 0
+        assert result["complexity_score"] >= 0
+
+    def test_dangerous_import_detected(self, scanner):
+        """测试检测到危险导入 (subprocess)."""
+        code = '''
+from subprocess import call
+call(["rm", "-rf", "/"])
+'''
+        result = scanner.scan(code)
+
+        assert result["passed"] is False
+        assert any(v["type"] == "dangerous_import" for v in result["violations"])
+
+    def test_dangerous_call_detected(self, scanner):
+        """测试检测到危险函数调用."""
+        code = '''
+user_input = input("Enter code: ")
+result = eval(user_input)
+'''
+        result = scanner.scan(code)
+
+        assert result["passed"] is False
+        assert any(v["type"] == "dangerous_call" for v in result["violations"])
+
+    def test_sensitive_attribute_detected(self, scanner):
+        """测试检测到敏感属性访问."""
+        code = '''
+obj = some_object
+secret = obj.__globals__
+'''
+        result = scanner.scan(code)
+
+        assert result["passed"] is False
+        assert any(v["type"] == "sensitive_attribute" for v in result["violations"])
+
+    def test_syntax_error_reported(self, scanner):
+        """测试语法错误被报告."""
+        code = '''
+def broken_function(
+    # Missing closing parenthesis and colon
+    pass
+'''
+        result = scanner.scan(code)
+
+        assert result["passed"] is False
+        assert any(v["type"] == "syntax_error" for v in result["violations"])
+
+    def test_complexity_estimation(self, scanner):
+        """测试复杂度估计."""
+        code = '''
+def complex_function(n):
+    result = 0
+    for i in range(n):
+        if i % 2 == 0:
+            for j in range(i):
+                if j > 5 and j < 10:
+                    result += j
+    return result
+'''
+        result = scanner.scan(code)
+
+        assert result["complexity_score"] > 0
+        # 应该检测到有决策点
+        assert result["complexity_score"] > 0.5
+
+
+class TestRedPhase:
+    """Red 阶段测试."""
+
+    @pytest.fixture
+    def service(self):
+        """创建 EvolutionService 实例."""
+        return EvolutionService()
+
+    @pytest.mark.asyncio
+    async def test_valid_test_code_passes(self, service):
+        """测试有效的测试代码通过 Red 阶段."""
+        tests = '''
+import pytest
+
+def test_addition():
+    assert 1 + 1 == 2
+'''
+        result = await service._phase_red(tests)
+
+        assert result["passed"] is True
+        assert result["error"] is None
+
+    @pytest.mark.asyncio
+    async def test_invalid_syntax_fails(self, service):
+        """测试无效语法在 Red 阶段失败."""
+        tests = '''
+def broken_test(
+    # Missing closing parenthesis
+    pass
+'''
+        result = await service._phase_red(tests)
+
+        assert result["passed"] is False
+        assert "syntax error" in result["error"].lower()
+
+
+class TestGreenPhase:
+    """Green 阶段测试."""
+
+    @pytest.fixture
+    def service(self):
+        """创建 EvolutionService 实例."""
+        return EvolutionService()
+
+    @pytest.mark.asyncio
+    async def test_code_passing_tests(self, service, evolution_setup):
+        """测试代码通过 pytest."""
+        holon_id = "green_test_holon"
+        # 先创建 Holon 目录
+        guard = HolonPathGuard(holon_id)
+        guard.ensure_directory("temp")
+
+        code = '''
+def add(a, b):
+    return a + b
+'''
+        tests = '''
+from skill_module import add
+
+def test_add():
+    assert add(1, 2) == 3
+    assert add(-1, 1) == 0
+'''
+        result = await service._phase_green(code, tests, holon_id)
+
+        if not result["passed"]:
+            print(f"Green phase failed: {result.get('error')}")
+            print(f"Details stdout: {result.get('details', {}).get('stdout')}")
+            print(f"Details stderr: {result.get('details', {}).get('stderr')}")
+        assert result["passed"] is True
+        assert result["details"]["exit_code"] == 0
+
+    @pytest.mark.asyncio
+    async def test_code_failing_tests(self, service, evolution_setup):
+        """测试代码失败 pytest."""
+        holon_id = "green_test_holon_fail"
+        guard = HolonPathGuard(holon_id)
+        guard.ensure_directory("temp")
+
+        code = '''
+def add(a, b):
+    return a - b  # Bug: subtraction instead of addition
+'''
+        tests = '''
+from skill_module import add
+
+def test_add():
+    assert add(1, 2) == 3
+'''
+        result = await service._phase_green(code, tests, holon_id)
+
+        assert result["passed"] is False
+        assert result["details"]["exit_code"] != 0
+
+
+class TestVerifyPhase:
+    """Verify 阶段测试."""
+
+    @pytest.fixture
+    def service(self):
+        """创建 EvolutionService 实例."""
+        return EvolutionService()
+
+    def test_safe_code_passes_verify(self, service):
+        """测试安全代码通过 Verify."""
+        code = '''
+def helper(data):
+    return sorted(data)
+'''
+        result = service._phase_verify(code)
+
+        assert result["passed"] is True
+        assert len(result["violations"]) == 0
+
+    def test_unsafe_code_fails_verify(self, service):
+        """测试不安全代码失败 Verify."""
+        code = '''
+import os
+
+def dangerous(path):
+    os.system(f"rm -rf {path}")
+'''
+        result = service._phase_verify(code)
+
+        assert result["passed"] is False
+        assert len(result["violations"]) > 0
+
+
+class TestPersistPhase:
+    """Persist 阶段测试."""
+
+    @pytest.fixture
+    def service(self):
+        """创建 EvolutionService 实例."""
+        return EvolutionService()
+
+    @pytest.fixture
+    def tool_schema(self):
+        """创建测试用的 ToolSchema."""
+        return ToolSchema(
+            name="test_skill",
+            description="A test skill",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "input": {"type": "string"}
+                }
+            },
+            required=["input"],
+        )
+
+    @pytest.mark.asyncio
+    async def test_skill_persisted_to_disk(self, evolution_setup, service, tool_schema):
+        """测试技能被持久化到磁盘."""
+        holon_id = "test_holon_001"
+
+        # 准备测试数据
+        code = '''
+def process(input_data):
+    return input_data.upper()
+'''
+        tests = '''
+from skill_module import process
+
+def test_process():
+    assert process("hello") == "HELLO"
+'''
+
+        green_result = {
+            "passed": True,
+            "details": {"exit_code": 0, "duration_ms": 100},
+        }
+        verify_result = {"passed": True, "violations": [], "complexity": 1.0}
+
+        result = await service._phase_persist(
+            holon_id=holon_id,
+            skill_name="UpperCase Skill",
+            code=code,
+            tests=tests,
+            description="Convert text to uppercase",
+            tool_schema=tool_schema,
+            version="0.1.0",
+            green_result=green_result,
+            verify_result=verify_result,
+        )
+
+        assert result["success"] is True
+        assert result["skill_id"] is not None
+        assert result["attestation"] is not None
+        assert Path(result["code_path"]).exists()
+        assert Path(result["test_path"]).exists()
+        assert Path(result["manifest_path"]).exists()
+
+        # 验证 Attestation 结构
+        att = result["attestation"]
+        assert att.red_phase_passed is True
+        assert att.green_phase_passed is True
+        assert att.verify_phase_passed is True
+        assert att.code_hash is not None
+        assert att.test_hash is not None
+
+    @pytest.mark.asyncio
+    async def test_attestation_file_created(self, evolution_setup, service, tool_schema):
+        """测试 Attestation 文件被创建."""
+        holon_id = "test_holon_002"
+
+        code = "def func(): pass"
+        tests = "def test_func(): pass"
+
+        result = await service._phase_persist(
+            holon_id=holon_id,
+            skill_name="Test Skill",
+            code=code,
+            tests=tests,
+            description="Test",
+            tool_schema=tool_schema,
+            version="1.0.0",
+            green_result={"passed": True, "details": {}},
+            verify_result={"passed": True, "violations": []},
+        )
+
+        # 检查 attestation.json 文件存在
+        skill_dir = Path(result["code_path"]).parent
+        att_file = skill_dir / "attestation.json"
+        assert att_file.exists()
+
+
+class TestFullRGVWorkflow:
+    """完整 RGV 工作流测试."""
+
+    @pytest.fixture
+    def service(self):
+        """创建 EvolutionService 实例."""
+        return EvolutionService()
+
+    @pytest.mark.asyncio
+    async def test_successful_evolution(self, evolution_setup, service, tool_schema):
+        """测试成功的技能演化."""
+        code = '''
+def add(a, b):
+    """Add two numbers."""
+    return a + b
+
+def multiply(a, b):
+    """Multiply two numbers."""
+    return a * b
+'''
+        tests = '''
+from skill_module import add, multiply
+
+def test_add():
+    assert add(2, 3) == 5
+    assert add(-1, 1) == 0
+
+def test_multiply():
+    assert multiply(2, 3) == 6
+    assert multiply(0, 5) == 0
+'''
+
+        result = await service.evolve_skill(
+            holon_id="evo_holon_001",
+            skill_name="Calculator",
+            code=code,
+            tests=tests,
+            description="Basic calculator operations",
+            tool_schema=tool_schema,
+            version="0.1.0",
+        )
+
+        assert result.success is True
+        assert result.phase == "complete"
+        assert result.attestation is not None
+        assert result.skill_id is not None
+
+    @pytest.mark.asyncio
+    async def test_evolution_fails_at_verify(self, evolution_setup, service, tool_schema):
+        """测试演化在 Verify 阶段失败."""
+        # 使用安全的测试代码，但危险的功能代码
+        code = '''
+import os
+
+def dangerous_delete(path):
+    """Dangerous function using os.system."""
+    os.system(f"rm -rf {path}")
+    return True
+'''
+        # 测试只是检查函数存在且能调用（不实际调用危险部分）
+        tests = '''
+import skill_module
+
+def test_function_exists():
+    assert hasattr(skill_module, 'dangerous_delete')
+    assert callable(skill_module.dangerous_delete)
+'''
+
+        result = await service.evolve_skill(
+            holon_id="evo_holon_002",
+            skill_name="DangerousSkill",
+            code=code,
+            tests=tests,
+            description="Should fail security scan",
+            tool_schema=tool_schema,
+            version="0.1.0",
+        )
+
+        assert result.success is False
+        assert result.phase == "verify"
+
+    @pytest.mark.asyncio
+    async def test_evolution_fails_at_green(self, evolution_setup, service, tool_schema):
+        """测试演化在 Green 阶段失败."""
+        code = '''
+def broken_add(a, b):
+    """Broken addition."""
+    return a - b  # Bug!
+'''
+        tests = '''
+from skill_module import broken_add
+
+def test_add():
+    assert broken_add(2, 3) == 5  # This will fail
+'''
+
+        result = await service.evolve_skill(
+            holon_id="evo_holon_003",
+            skill_name="BrokenSkill",
+            code=code,
+            tests=tests,
+            description="Has a bug",
+            tool_schema=tool_schema,
+            version="0.1.0",
+        )
+
+        assert result.success is False
+        assert result.phase == "green"
+
+
+class TestAttestation:
+    """Attestation 测试."""
+
+    def test_attestation_creation(self):
+        """测试 Attestation 创建."""
+        att = Attestation(
+            attestation_id="att_001",
+            holon_id="holon_001",
+            skill_name="TestSkill",
+            version="1.0.0",
+            red_phase_passed=True,
+            green_phase_passed=True,
+            verify_phase_passed=True,
+            code_hash="abc123",
+            test_hash="def456",
+        )
+
+        assert att.attestation_id == "att_001"
+        assert att.red_phase_passed is True
+
+    def test_attestation_to_dict(self):
+        """测试 Attestation 序列化."""
+        att = Attestation(
+            attestation_id="att_002",
+            holon_id="holon_002",
+            skill_name="AnotherSkill",
+            version="0.5.0",
+            red_phase_passed=True,
+            green_phase_passed=True,
+            verify_phase_passed=True,
+        )
+
+        data = att.to_dict()
+
+        assert data["attestation_id"] == "att_002"
+        assert data["red_phase_passed"] is True
+        assert data["code_hash"] == att.code_hash
+
+
+class TestEvolutionResult:
+    """EvolutionResult 测试."""
+
+    def test_success_result(self):
+        """测试成功结果."""
+        result = EvolutionResult(
+            success=True,
+            skill_id="skill_001",
+            phase="complete",
+            code_path="/path/to/code.py",
+        )
+
+        assert result.success is True
+        assert result.skill_id == "skill_001"
+
+    def test_failure_result(self):
+        """测试失败结果."""
+        result = EvolutionResult(
+            success=False,
+            phase="verify",
+            error_message="Security violation found",
+        )
+
+        assert result.success is False
+        assert result.phase == "verify"
+        assert "Security violation" in result.error_message
+
+
+@pytest.fixture
+def tool_schema():
+    """创建测试用的 ToolSchema."""
+    return ToolSchema(
+        name="calculator",
+        description="A calculator skill",
+        parameters={
+            "type": "object",
+            "properties": {
+                "a": {"type": "number"},
+                "b": {"type": "number"},
+            }
+        },
+        required=["a", "b"],
+    )
+
+
+class TestValidateExistingSkill:
+    """验证已有技能测试."""
+
+    @pytest.mark.asyncio
+    async def test_validate_missing_skill(self, evolution_setup):
+        """测试验证不存在的技能."""
+        service = EvolutionService()
+
+        result = await service.validate_existing_skill(
+            holon_id="missing_holon",
+            skill_name="missing_skill",
+        )
+
+        assert result["valid"] is False
+        assert "not found" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_validate_existing_skill(self, evolution_setup, tool_schema):
+        """测试验证已存在的技能."""
+        service = EvolutionService()
+        holon_id = "validate_holon"
+
+        # 先创建一个技能
+        code = '''
+def helper(x):
+    return x * 2
+'''
+        tests = '''
+from skill_module import helper
+
+def test_helper():
+    assert helper(5) == 10
+'''
+
+        await service._phase_persist(
+            holon_id=holon_id,
+            skill_name="HelperSkill",
+            code=code,
+            tests=tests,
+            description="A helper skill",
+            tool_schema=tool_schema,
+            version="1.0.0",
+            green_result={"passed": True, "details": {}},
+            verify_result={"passed": True, "violations": []},
+        )
+
+        # 然后验证它
+        result = await service.validate_existing_skill(
+            holon_id=holon_id,
+            skill_name="HelperSkill",
+        )
+
+        assert result["valid"] is True
+        assert result["green_passed"] is True
+        assert result["verify_passed"] is True

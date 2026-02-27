@@ -2,12 +2,16 @@
 
 Enforces: Each Holon has its own isolated LanceDB.
 Provides: Unified interface for remember/recall/episode recording.
+
+铁律：所有检索必须使用 Hybrid Search (FTS + Vector)。
+Sniper Mode: 通过精确检索最大化上下文质量，最小化 token 消耗。
 """
 
 import json
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import structlog
 
@@ -16,6 +20,30 @@ from holonpolis.kernel.embeddings.default_embedder import get_embedder
 from holonpolis.kernel.lancedb.lancedb_factory import get_lancedb_factory
 
 logger = structlog.get_logger()
+
+
+@dataclass
+class HybridSearchResult:
+    """Hybrid Search 结果项。
+
+    结合 FTS 和 Vector 搜索的结果，包含融合分数。
+    """
+    memory_id: str
+    content: str
+    kind: str
+    tags: List[str]
+    importance: float
+    success_score: Optional[float]
+    created_at: str
+
+    # 搜索分数
+    vector_score: float  # 向量相似度 (0-1)
+    text_score: float  # 文本匹配分数 (0-1)
+    hybrid_score: float  # 融合分数 (加权组合)
+
+    # 源信息
+    source_episode_id: Optional[str] = None
+    source_skill: Optional[str] = None
 
 
 class MemoryService:
@@ -67,6 +95,10 @@ class MemoryService:
 
         # Generate embedding
         embedding = await self.embedder.embed_single(content)
+
+        # 确保 kind 是 MemoryKind 枚举
+        if isinstance(kind, str):
+            kind = MemoryKind(kind)
 
         memory = MemoryRecord(
             memory_id=memory_id,
@@ -296,3 +328,269 @@ class MemoryService:
             }
             for r in results
         ]
+
+    async def hybrid_search(
+        self,
+        query: str,
+        top_k: int = 5,
+        vector_weight: float = 0.7,
+        text_weight: float = 0.3,
+        filters: Optional[Dict[str, Any]] = None,
+        min_score: float = 0.5,
+    ) -> List[HybridSearchResult]:
+        """混合搜索 (Hybrid Search): 结合 FTS + Vector 检索。
+
+        铁律：所有检索必须使用 Hybrid Search。
+
+        Args:
+            query: 查询文本
+            top_k: 返回结果数量
+            vector_weight: 向量搜索权重 (0-1)
+            text_weight: 全文搜索权重 (0-1)
+            filters: 过滤条件 {"kind": "fact", "tags": ["math"]}
+            min_score: 最低融合分数阈值
+
+        Returns:
+            按 hybrid_score 排序的结果列表
+        """
+        conn = self._get_connection()
+        table = conn.get_table("memories")
+
+        # 1. 向量搜索
+        query_embedding = await self.embedder.embed_single(query)
+        vector_results = table.search(
+            query_embedding, vector_column_name="embedding"
+        ).limit(top_k * 2).to_list()
+
+        vector_scores = {}
+        for r in vector_results:
+            dist = r.get("_distance", 0.0)
+            # Cosine distance -> similarity
+            sim = 1.0 - float(dist)
+            vector_scores[r["memory_id"]] = {
+                "record": r,
+                "score": max(0.0, sim),
+            }
+
+        # 2. 全文搜索 (FTS)
+        try:
+            # LanceDB FTS 语法: 使用 search(query, query_type="fts")
+            text_results = table.search(
+                query, query_type="fts"
+            ).limit(top_k * 2).to_list()
+
+            text_scores = {}
+            for r in text_results:
+                # FTS 返回的是 BM25 分数，需要归一化
+                score = r.get("_score", 0.0)
+                # BM25 分数无上限，使用 sigmoid 归一化到 0-1
+                import math
+                normalized = 1.0 / (1.0 + math.exp(-score / 5.0))
+                text_scores[r["memory_id"]] = {
+                    "record": r,
+                    "score": normalized,
+                }
+        except Exception as e:
+            # FTS 可能未启用或失败，只使用向量结果
+            logger.warning("fts_search_failed", error=str(e), holon_id=self.holon_id)
+            text_scores = {}
+
+        # 3. 融合分数 (RRF - Reciprocal Rank Fusion)
+        all_ids = set(vector_scores.keys()) | set(text_scores.keys())
+        fused_results = []
+
+        for memory_id in all_ids:
+            v_data = vector_scores.get(memory_id, {})
+            t_data = text_scores.get(memory_id, {})
+
+            v_score = v_data.get("score", 0.0)
+            t_score = t_data.get("score", 0.0)
+
+            # 加权融合
+            hybrid_score = (vector_weight * v_score) + (text_weight * t_score)
+
+            # 使用任一侧的记录数据
+            record = v_data.get("record") or t_data.get("record")
+            if record is None:
+                continue
+
+            # 应用过滤器
+            if filters:
+                if "kind" in filters and record.get("kind") != filters["kind"]:
+                    continue
+                if "min_importance" in filters:
+                    if record.get("importance", 0) < filters["min_importance"]:
+                        continue
+                if "tags" in filters:
+                    record_tags = set(record.get("tags", []))
+                    if not any(tag in record_tags for tag in filters["tags"]):
+                        continue
+
+            if hybrid_score >= min_score:
+                fused_results.append(
+                    HybridSearchResult(
+                        memory_id=record["memory_id"],
+                        content=record["content"],
+                        kind=record["kind"],
+                        tags=record.get("tags", []),
+                        importance=record.get("importance", 1.0),
+                        success_score=record.get("success_score"),
+                        created_at=record.get("created_at", ""),
+                        vector_score=v_score,
+                        text_score=t_score,
+                        hybrid_score=hybrid_score,
+                        source_episode_id=record.get("source_episode_id"),
+                        source_skill=record.get("source_skill"),
+                    )
+                )
+
+        # 按 hybrid_score 降序排序
+        fused_results.sort(key=lambda x: x.hybrid_score, reverse=True)
+
+        logger.debug(
+            "hybrid_search_completed",
+            holon_id=self.holon_id,
+            query=query[:50],
+            results=len(fused_results),
+            vector_hits=len(vector_scores),
+            text_hits=len(text_scores),
+        )
+
+        return fused_results[:top_k]
+
+    async def sniper_mode_retrieval(
+        self,
+        query: str,
+        max_context_tokens: int = 4000,
+        context_per_item: int = 200,  # 预估每个记忆项的 token 数
+    ) -> Dict[str, Any]:
+        """Sniper Mode 上下文汇聚 - 精确检索，最小冗余。
+
+        策略:
+        1. 使用 Hybrid Search 获取候选集
+        2. 根据重要性、成功分数、时效性重排序
+        3. 在 token 预算内选择最高质量的上下文
+
+        Args:
+            query: 查询文本
+            max_context_tokens: 最大 token 预算
+            context_per_item: 预估每个记忆项占用的 token 数
+
+        Returns:
+            {
+                "memories": List[HybridSearchResult],
+                "total_tokens": int,
+                "coverage": float,  # 查询意图覆盖率估计
+            }
+        """
+        # 计算可以包含的记忆项数量
+        max_items = max(1, max_context_tokens // context_per_item)
+
+        # 获取候选集 (2x 以确保有足够的选择)
+        candidates = await self.hybrid_search(
+            query=query,
+            top_k=max_items * 2,
+            vector_weight=0.6,
+            text_weight=0.4,
+            min_score=0.3,
+        )
+
+        if not candidates:
+            return {
+                "memories": [],
+                "total_tokens": 0,
+                "coverage": 0.0,
+            }
+
+        # Sniper Mode 重排序算法
+        # 综合因素: hybrid_score, importance, success_score, recency
+        scored_candidates = []
+        now = datetime.utcnow()
+
+        for c in candidates:
+            # 基础分数: hybrid search 结果
+            score = c.hybrid_score
+
+            # 重要性加权
+            score *= (0.5 + c.importance)  # importance 范围通常 0-2
+
+            # 成功分数加权 (如果有)
+            if c.success_score is not None:
+                score *= (0.8 + 0.4 * c.success_score)  # 0.8-1.2x
+
+            # 时效性衰减 (简单的线性衰减)
+            try:
+                created = datetime.fromisoformat(c.created_at.replace("Z", "+00:00"))
+                days_old = (now - created).days
+                recency_factor = max(0.5, 1.0 - (days_old / 365))  # 一年内线性衰减
+                score *= recency_factor
+            except Exception:
+                pass
+
+            scored_candidates.append((score, c))
+
+        # 按综合分数排序
+        scored_candidates.sort(key=lambda x: x[0], reverse=True)
+
+        # 在 token 预算内选择
+        selected = []
+        total_tokens = 0
+
+        for score, candidate in scored_candidates:
+            if len(selected) >= max_items:
+                break
+            selected.append(candidate)
+            total_tokens += context_per_item
+
+        # 计算覆盖率 (基于 hybrid_score 的加权平均)
+        coverage = sum(c.hybrid_score for c in selected) / len(selected) if selected else 0.0
+
+        logger.debug(
+            "sniper_mode_retrieval_completed",
+            holon_id=self.holon_id,
+            query=query[:50],
+            selected=len(selected),
+            candidates=len(candidates),
+            coverage=coverage,
+        )
+
+        return {
+            "memories": selected,
+            "total_tokens": total_tokens,
+            "coverage": coverage,
+        }
+
+    async def recall_with_sniper_mode(
+        self,
+        query: str,
+        top_k: int = 5,
+        **filters
+    ) -> List[Dict[str, Any]]:
+        """使用 Sniper Mode 的记忆检索 (兼容旧接口)。
+
+        这是 recall 方法的增强版，使用 Hybrid Search + Sniper Mode。
+        """
+        # 估算 token 预算: top_k * 200 tokens per item
+        max_tokens = top_k * 200
+
+        result = await self.sniper_mode_retrieval(
+            query=query,
+            max_context_tokens=max_tokens,
+            context_per_item=200,
+        )
+
+        # 转换为旧接口格式
+        memories = []
+        for m in result["memories"]:
+            memories.append({
+                "memory_id": m.memory_id,
+                "content": m.content,
+                "kind": m.kind,
+                "tags": m.tags,
+                "importance": m.importance,
+                "success_score": m.success_score,
+                "similarity": m.hybrid_score,  # 使用 hybrid_score 作为相似度
+                "created_at": m.created_at,
+            })
+
+        return memories

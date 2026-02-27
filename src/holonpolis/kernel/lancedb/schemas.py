@@ -1,4 +1,8 @@
-"""LanceDB table schemas using PyArrow."""
+"""LanceDB table schemas using PyArrow.
+
+铁律：所有检索必须使用 Hybrid Search (FTS + Vector)。
+因此 memories 表必须配置全文搜索索引。
+"""
 
 import pyarrow as pa
 
@@ -6,12 +10,19 @@ DEFAULT_EMBEDDING_DIMENSION = 1536
 
 
 def build_memories_schema(embedding_dimension: int = DEFAULT_EMBEDDING_DIMENSION) -> pa.Schema:
-    """Build memories table schema with fixed-size vectors."""
+    """Build memories table schema with fixed-size vectors.
+
+    Schema optimized for Hybrid Search:
+    - content: 用于全文搜索 (FTS)
+    - embedding: 用于向量搜索 (Vector)
+    - tags: 用于过滤
+    - importance: 用于重排序
+    """
     return pa.schema([
         pa.field("memory_id", pa.string(), nullable=False),
         pa.field("holon_id", pa.string(), nullable=False),
         pa.field("kind", pa.string(), nullable=False),  # MemoryKind value
-        pa.field("content", pa.string(), nullable=False),
+        pa.field("content", pa.string(), nullable=False),  # FTS 索引字段
         pa.field("embedding", pa.list_(pa.float32(), embedding_dimension), nullable=False),
         pa.field("tags", pa.list_(pa.string()), nullable=False),
         pa.field("importance", pa.float32(), nullable=False),
@@ -23,6 +34,14 @@ def build_memories_schema(embedding_dimension: int = DEFAULT_EMBEDDING_DIMENSION
         pa.field("access_count", pa.int32(), nullable=False),
         pa.field("decay_factor", pa.float32(), nullable=False),
     ])
+
+
+# FTS (Full-Text Search) index configuration for memories table
+# LanceDB 使用 Tantivy 作为底层 FTS 引擎
+MEMORIES_FTS_INDEX_CONFIG = {
+    "columns": ["content"],  # 对 content 字段建立 FTS 索引
+    "tokenizer": "default",  # 标准分词器
+}
 
 
 # Schema for episodes table (full interaction records)

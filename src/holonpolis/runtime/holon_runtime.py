@@ -137,9 +137,21 @@ class HolonRuntime:
         messages.append(LLMMessage(role="user", content=user_message))
 
         # 3. Call LLM
+        # Map provider to correct model
+        provider_model_map = {
+            "minimax": getattr(settings, "minimax_model", "MiniMax-M2.5"),
+            "kimi": getattr(settings, "kimi_model", "moonshot-v1-8k"),
+            "kimi-coding": "kimi-for-coding",
+            "ollama": getattr(settings, "ollama_model", "qwen2.5-coder:14b"),
+            "ollama-local": getattr(settings, "ollama_model", "qwen2.5-coder:14b"),
+            "openai": getattr(settings, "openai_model", "gpt-4o-mini"),
+            "anthropic": getattr(settings, "anthropic_model", "claude-3-5-sonnet-latest"),
+        }
+        default_model = provider_model_map.get(settings.llm_provider, settings.openai_model)
+
         config = LLMConfig(
             provider_id=settings.llm_provider,
-            model=settings.openai_model,
+            model=default_model,
             temperature=settings.llm_temperature,
             max_tokens=min(
                 self.blueprint.boundary.max_tokens_per_episode,

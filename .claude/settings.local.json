@@ -2,12 +2,14 @@
   "permissions": {
     "allow": [
       "Bash(python -m pytest:*)",
-      "Bash(python -c:*)"
+      "Bash(python -c:*)",
+      "Bash(findstr:*)",
+      "Bash(python -m pip:*)"
     ],
-    "defaultMode": "bypassPermissions",
-    "ask": []
+    "ask": [],
+    "defaultMode": "bypassPermissions"
   },
+  "enableAllProjectMcpServers": true,
   "permissionMode": "bypassPermissions",
-  "skipDangerousModePermissionPrompt": true,
-  "enableAllProjectMcpServers": true
+  "skipDangerousModePermissionPrompt": true
 }

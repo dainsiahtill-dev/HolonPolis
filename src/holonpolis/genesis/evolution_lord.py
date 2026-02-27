@@ -113,9 +113,21 @@ class EvolutionLord:
             user_request, available_holons, conversation_history
         )
 
+        # Select appropriate model based on provider
+        provider_model_map = {
+            "minimax": getattr(settings, "minimax_model", "MiniMax-M2.5"),
+            "kimi": getattr(settings, "kimi_model", "moonshot-v1-8k") if hasattr(settings, "kimi_model") else "moonshot-v1-8k",
+            "kimi-coding": "kimi-for-coding",
+            "ollama": getattr(settings, "ollama_model", "qwen2.5-coder:14b"),
+            "ollama-local": getattr(settings, "ollama_model", "qwen2.5-coder:14b"),
+            "openai": getattr(settings, "openai_model", "gpt-4o-mini"),
+            "anthropic": getattr(settings, "anthropic_model", "claude-3-5-sonnet-latest"),
+        }
+        default_model = provider_model_map.get(settings.llm_provider, settings.openai_model)
+
         config = LLMConfig(
             provider_id=settings.llm_provider,
-            model=settings.openai_model,
+            model=default_model,
             temperature=0.3,  # Lower for more deterministic decisions
             max_tokens=min(2048, settings.llm_max_tokens),
         )
@@ -129,6 +141,20 @@ class EvolutionLord:
 
             # Parse the JSON response
             content = response.content.strip()
+
+            # Handle <think> tags (MiniMax and other reasoning models)
+            if "<think>" in content and "</think>" in content:
+                # Extract content after </think> tag where JSON usually is
+                after_think = content.split("</think>")[-1].strip()
+                if after_think:
+                    content = after_think
+                else:
+                    # Try to find JSON inside think tags
+                    import re
+                    json_match = re.search(r'```json\s*(\{.*?\})\s*```', content, re.DOTALL)
+                    if json_match:
+                        content = json_match.group(1)
+
             # Handle markdown code blocks
             if content.startswith("```json"):
                 content = content[7:]
@@ -138,7 +164,17 @@ class EvolutionLord:
                 content = content[:-3]
             content = content.strip()
 
-            decision_data = json.loads(content)
+            # Try to extract JSON if embedded in text
+            try:
+                decision_data = json.loads(content)
+            except json.JSONDecodeError:
+                # Try to find JSON object in the content
+                import re
+                json_match = re.search(r'\{[\s\S]*"decision"[\s\S]*\}', content)
+                if json_match:
+                    decision_data = json.loads(json_match.group(0))
+                else:
+                    raise
             return self._parse_decision(decision_data)
 
         except json.JSONDecodeError as e:

@@ -54,7 +54,7 @@ class Settings(BaseSettings):
 
     # LLM configuration
     llm_provider: str = Field(
-        default_factory=lambda: env_str("HOLONPOLIS_LLM_DEFAULT_PROVIDER", "openai")
+        default_factory=lambda: env_str("HOLONPOLIS_LLM_DEFAULT_PROVIDER", "kimi")
     )
     openai_api_key: Optional[str] = None
     openai_base_url: Optional[str] = None
@@ -75,6 +75,11 @@ class Settings(BaseSettings):
         default_factory=lambda: env_str("KIMI_BASE_URL", "https://api.moonshot.cn/v1")
     )
     kimi_model: str = Field(default_factory=lambda: env_str("KIMI_MODEL", "moonshot-v1-8k"))
+    minimax_api_key: Optional[str] = None
+    minimax_base_url: str = Field(
+        default_factory=lambda: env_str("MINIMAX_BASE_URL", "https://api.minimaxi.com/v1")
+    )
+    minimax_model: str = Field(default_factory=lambda: env_str("MINIMAX_MODEL", "MiniMax-M2.5"))
     gemini_api_key: Optional[str] = None
     gemini_base_url: str = Field(
         default_factory=lambda: env_str("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com")
