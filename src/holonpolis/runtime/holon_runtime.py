@@ -15,6 +15,12 @@ from holonpolis.config import settings
 from holonpolis.domain import Blueprint
 from holonpolis.domain.memory import MemoryKind
 from holonpolis.kernel.llm.llm_runtime import LLMConfig, LLMMessage, get_llm_runtime
+from holonpolis.kernel.tools import (
+    ToolExecutor,
+    ToolChainStep,
+    ToolChainResult,
+    execute_tool,
+)
 from holonpolis.services.holon_service import HolonService
 from holonpolis.services.memory_service import MemoryService
 
@@ -40,12 +46,20 @@ class HolonRuntime:
     - Episode recording
     """
 
-    def __init__(self, holon_id: str, blueprint: Optional[Blueprint] = None):
+    def __init__(self, holon_id: str, blueprint: Optional[Blueprint] = None, workspace: Optional[str] = None):
         self.holon_id = holon_id
         self.blueprint = blueprint or self._load_blueprint()
         self.memory = MemoryService(holon_id)
         self.llm = get_llm_runtime()
         self.state = HolonState()
+
+        # Initialize tool executor with blueprint permissions
+        ws = workspace or str(getattr(settings, 'workspace_root', '.'))
+        self.tool_executor = ToolExecutor(
+            workspace=ws,
+            allow_write=self.blueprint.boundary.allow_file_write,
+            allow_exec=self.blueprint.boundary.allow_subprocess,
+        )
 
     def _load_blueprint(self) -> Blueprint:
         """Load blueprint from disk."""
@@ -54,13 +68,14 @@ class HolonRuntime:
 
     def _build_system_prompt(self) -> str:
         """Build the system prompt from blueprint."""
+        available_tools = self.get_available_tools()
         lines = [
             f"You are {self.blueprint.name}, a specialized AI assistant.",
             "",
             f"Your purpose: {self.blueprint.purpose}",
             "",
             "# Your Capabilities",
-            f"Allowed tools: {', '.join(self.blueprint.boundary.allowed_tools) or 'None configured'}",
+            f"Available tools: {', '.join(available_tools) or 'None configured'}",
             "",
             "# Constraints",
             f"- File write access: {'Yes' if self.blueprint.boundary.allow_file_write else 'No'}",
@@ -143,12 +158,13 @@ class HolonRuntime:
             self.state.episode_count += 1
 
             # 5. Record episode
+            tool_chain = self.state.context.get("last_tool_chain", [])
             episode_id = await self.memory.write_episode(
                 transcript=[
                     {"role": "user", "content": user_message},
                     {"role": "assistant", "content": response.content},
                 ],
-                tool_chain=[],  # Would be populated if tools were used
+                tool_chain=tool_chain,
                 outcome="success",
                 cost=response.usage.total_tokens * 0.00001,  # Rough estimate
                 latency_ms=latency_ms,
@@ -267,6 +283,114 @@ class HolonRuntime:
 
         return evolution_id
 
+    async def execute_tool(
+        self,
+        tool: str,
+        args: Dict[str, Any],
+        *,
+        act_files: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Execute a tool through the tool executor.
+
+        Args:
+            tool: Tool name
+            args: Tool arguments
+            act_files: Declared scope files for write validation
+
+        Returns:
+            Tool execution result
+        """
+        result = self.tool_executor.execute(tool, args, act_files=act_files)
+
+        # Record tool execution in state context
+        tool_step = {
+            "tool": tool,
+            "args": args,
+            "result": result,
+        }
+        if "last_tool_chain" not in self.state.context:
+            self.state.context["last_tool_chain"] = []
+        self.state.context["last_tool_chain"].append(tool_step)
+
+        return result
+
+    async def execute_tool_chain(
+        self,
+        steps: List[ToolChainStep],
+    ) -> ToolChainResult:
+        """Execute a chain of tools with dependency resolution.
+
+        Args:
+            steps: List of tool chain steps
+
+        Returns:
+            ToolChainResult with execution results
+        """
+        outputs: List[Dict[str, Any]] = []
+        errors: List[str] = []
+        saved_results: Dict[str, Any] = {}
+
+        completed = 0
+        failed = 0
+        retried = 0
+
+        for step in steps:
+            # Resolve input from saved results if specified
+            args = dict(step.args)
+            if step.input_from and step.input_from in saved_results:
+                # Merge saved result into args
+                args.update(saved_results[step.input_from])
+
+            # Execute with retry logic
+            result = None
+            for attempt in range(step.max_retries + 1):
+                result = await self.execute_tool(step.tool, args)
+
+                if result.get("ok"):
+                    completed += 1
+                    break
+                elif attempt < step.max_retries and step.on_error == "retry":
+                    retried += 1
+                    continue
+                else:
+                    failed += 1
+                    errors.append(f"{step.tool}: {result.get('error', 'unknown error')}")
+                    if step.on_error == "stop":
+                        break
+
+            if result:
+                outputs.append({
+                    "step_id": step.step_id,
+                    "tool": step.tool,
+                    "result": result,
+                })
+
+                # Save result if requested
+                if step.save_as:
+                    saved_results[step.save_as] = result
+
+        return ToolChainResult(
+            ok=failed == 0,
+            outputs=outputs,
+            errors=errors,
+            total_steps=len(steps),
+            completed_steps=completed,
+            failed_steps=failed,
+            retried_steps=retried,
+            saved_results=saved_results,
+        )
+
+    def get_available_tools(self) -> List[str]:
+        """Get list of tools available to this holon based on permissions."""
+        from holonpolis.kernel.tools import supported_tool_names, read_tool_names, write_tool_names, exec_tool_names
+
+        tools = set(read_tool_names())
+        if self.blueprint.boundary.allow_file_write:
+            tools.update(write_tool_names())
+        if self.blueprint.boundary.allow_subprocess:
+            tools.update(exec_tool_names())
+        return sorted(tools)
+
     def get_stats(self) -> Dict[str, Any]:
         """Get runtime statistics."""
         return {
@@ -275,4 +399,5 @@ class HolonRuntime:
             "species": self.blueprint.species_id,
             "episode_count": self.state.episode_count,
             "total_tokens": self.state.total_tokens,
+            "available_tools": len(self.get_available_tools()),
         }

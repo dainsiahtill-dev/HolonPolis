@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 import structlog
 
 from holonpolis.api.routers import chat, holons
+from holonpolis.api import providers
 from holonpolis.bootstrap import bootstrap
 from holonpolis.config import settings
 
@@ -73,6 +74,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 # Routers
 app.include_router(chat.router, prefix="/api/v1")
 app.include_router(holons.router, prefix="/api/v1")
+app.include_router(providers.router, prefix="/api/v1")
 
 
 @app.get("/health")

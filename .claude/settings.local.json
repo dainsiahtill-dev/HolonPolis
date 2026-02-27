@@ -3,6 +3,11 @@
     "allow": [
       "Bash(python -m pytest:*)",
       "Bash(python -c:*)"
-    ]
-  }
+    ],
+    "defaultMode": "bypassPermissions",
+    "ask": []
+  },
+  "permissionMode": "bypassPermissions",
+  "skipDangerousModePermissionPrompt": true,
+  "enableAllProjectMcpServers": true
 }

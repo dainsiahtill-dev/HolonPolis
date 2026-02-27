@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional, Tuple
 
 from holonpolis.config import settings
+from holonpolis.infrastructure.storage.io_text import write_json_atomic, read_json_safe
 
 
 def _env(name: str, default: str = "") -> str:
@@ -163,3 +165,336 @@ def load_provider_bundle() -> Dict[str, Any]:
         bundle = _deep_merge(bundle, env_payload)
 
     return _normalize_bundle(bundle)
+
+
+MASKED_SECRET = "********"
+
+
+@dataclass
+class ProviderConfig:
+    """Configuration for a single LLM provider."""
+
+    provider_id: str
+    provider_type: str
+    name: str
+    base_url: str = ""
+    api_key: str = ""
+    api_path: str = "/v1/chat/completions"
+    models_path: str = "/v1/models"
+    timeout: int = 60
+    retries: int = 3
+    temperature: float = 0.7
+    max_tokens: int = 8192
+    extra_headers: Dict[str, str] = field(default_factory=dict)
+    model_specific: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self, mask_secrets: bool = False) -> Dict[str, Any]:
+        """Convert to dictionary, optionally masking secrets."""
+        result = {
+            "provider_id": self.provider_id,
+            "provider_type": self.provider_type,
+            "name": self.name,
+            "base_url": self.base_url,
+            "api_path": self.api_path,
+            "models_path": self.models_path,
+            "timeout": self.timeout,
+            "retries": self.retries,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "extra_headers": self.extra_headers,
+            "model_specific": self.model_specific,
+        }
+        if mask_secrets:
+            result["api_key"] = MASKED_SECRET if self.api_key else ""
+        else:
+            result["api_key"] = self.api_key
+        return result
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ProviderConfig":
+        """Create from dictionary."""
+        return cls(
+            provider_id=data.get("provider_id", ""),
+            provider_type=data.get("provider_type", data.get("type", "openai_compat")),
+            name=data.get("name", "Unnamed Provider"),
+            base_url=data.get("base_url", ""),
+            api_key=data.get("api_key", ""),
+            api_path=data.get("api_path", "/v1/chat/completions"),
+            models_path=data.get("models_path", "/v1/models"),
+            timeout=data.get("timeout", 60),
+            retries=data.get("retries", 3),
+            temperature=data.get("temperature", 0.7),
+            max_tokens=data.get("max_tokens", 8192),
+            extra_headers=data.get("extra_headers", {}),
+            model_specific=data.get("model_specific", {}),
+        )
+
+
+class ProviderConfigManager:
+    """Manages LLM provider configurations with persistence."""
+
+    def __init__(self, config_dir: Optional[str] = None):
+        """Initialize with config directory.
+
+        Args:
+            config_dir: Directory to store configs (default: ~/.holonpolis/config)
+        """
+        if config_dir is None:
+            config_dir = str(settings.holonpolis_root / "config")
+        self.config_dir = config_dir
+        self.config_file = os.path.join(config_dir, "llm", "providers.json")
+        self._providers: Dict[str, ProviderConfig] = {}
+        self._load()
+
+    def _load(self) -> None:
+        """Load providers from disk."""
+        data = read_json_safe(self.config_file)
+        if not data:
+            # Initialize from defaults
+            bundle = load_provider_bundle()
+            self._providers = {
+                pid: ProviderConfig.from_dict({"provider_id": pid, **pcfg})
+                for pid, pcfg in bundle.get("providers", {}).items()
+            }
+            self._save()
+            return
+
+        providers_data = data.get("providers", {})
+        self._providers = {
+            pid: ProviderConfig.from_dict(pcfg)
+            for pid, pcfg in providers_data.items()
+        }
+
+    def _save(self) -> None:
+        """Save providers to disk."""
+        data = {
+            "version": 1,
+            "providers": {
+                pid: pcfg.to_dict(mask_secrets=False)
+                for pid, pcfg in self._providers.items()
+            },
+        }
+        write_json_atomic(self.config_file, data)
+
+    def list_providers(self, mask_secrets: bool = True) -> List[Dict[str, Any]]:
+        """List all providers.
+
+        Args:
+            mask_secrets: Whether to mask API keys
+
+        Returns:
+            List of provider configs as dicts
+        """
+        return [
+            pcfg.to_dict(mask_secrets=mask_secrets)
+            for pcfg in self._providers.values()
+        ]
+
+    def get_provider(self, provider_id: str) -> Optional[ProviderConfig]:
+        """Get a provider by ID."""
+        return self._providers.get(provider_id)
+
+    def add_provider(self, config: ProviderConfig) -> Tuple[bool, str]:
+        """Add or update a provider.
+
+        Args:
+            config: Provider configuration
+
+        Returns:
+            Tuple of (success, message)
+        """
+        # Validate
+        valid, errors = self._validate_config(config)
+        if not valid:
+            return False, f"Validation failed: {', '.join(errors)}"
+
+        self._providers[config.provider_id] = config
+        self._save()
+        return True, f"Provider '{config.provider_id}' saved"
+
+    def update_provider(
+        self,
+        provider_id: str,
+        updates: Dict[str, Any],
+    ) -> Tuple[bool, str]:
+        """Update a provider configuration.
+
+        Args:
+            provider_id: Provider ID to update
+            updates: Dictionary of updates
+
+        Returns:
+            Tuple of (success, message)
+        """
+        provider = self._providers.get(provider_id)
+        if not provider:
+            return False, f"Provider '{provider_id}' not found"
+
+        # Handle masked API key
+        if "api_key" in updates and updates["api_key"] == MASKED_SECRET:
+            updates.pop("api_key")  # Keep existing
+
+        # Update fields
+        for key, value in updates.items():
+            if hasattr(provider, key):
+                setattr(provider, key, value)
+
+        self._save()
+        return True, f"Provider '{provider_id}' updated"
+
+    def delete_provider(self, provider_id: str) -> Tuple[bool, str]:
+        """Delete a provider.
+
+        Args:
+            provider_id: Provider ID to delete
+
+        Returns:
+            Tuple of (success, message)
+        """
+        if provider_id not in self._providers:
+            return False, f"Provider '{provider_id}' not found"
+
+        del self._providers[provider_id]
+        self._save()
+        return True, f"Provider '{provider_id}' deleted"
+
+    def _validate_config(self, config: ProviderConfig) -> Tuple[bool, List[str]]:
+        """Validate provider configuration."""
+        errors = []
+
+        if not config.provider_id:
+            errors.append("provider_id is required")
+        if not config.provider_type:
+            errors.append("provider_type is required")
+        if not config.name:
+            errors.append("name is required")
+
+        # Validate URL format if provided
+        if config.base_url:
+            if not config.base_url.startswith(("http://", "https://")):
+                errors.append("base_url must be a valid HTTP(S) URL")
+
+        return len(errors) == 0, errors
+
+    def health_check(self, provider_id: str) -> Dict[str, Any]:
+        """Perform health check on a provider.
+
+        Args:
+            provider_id: Provider ID to check
+
+        Returns:
+            Health check result
+        """
+        provider = self._providers.get(provider_id)
+        if not provider:
+            return {
+                "healthy": False,
+                "error": f"Provider '{provider_id}' not found",
+            }
+
+        # Simple connectivity check
+        import urllib.request
+        import urllib.error
+
+        try:
+            url = f"{provider.base_url}{provider.models_path}"
+            req = urllib.request.Request(url, method="GET")
+            req.add_header("Accept", "application/json")
+
+            if provider.api_key:
+                req.add_header("Authorization", f"Bearer {provider.api_key}")
+
+            with urllib.request.urlopen(req, timeout=provider.timeout) as response:
+                status = response.status
+                if status == 200:
+                    return {
+                        "healthy": True,
+                        "status": status,
+                        "message": "Provider is responsive",
+                    }
+                else:
+                    return {
+                        "healthy": False,
+                        "status": status,
+                        "message": f"Unexpected status code: {status}",
+                    }
+
+        except urllib.error.HTTPError as e:
+            # 401/403 is actually "healthy" - means endpoint exists
+            if e.code in (401, 403):
+                return {
+                    "healthy": True,
+                    "status": e.code,
+                    "message": "Endpoint exists (auth required)",
+                }
+            return {
+                "healthy": False,
+                "status": e.code,
+                "error": str(e.reason),
+            }
+        except Exception as e:
+            return {
+                "healthy": False,
+                "error": str(e),
+            }
+
+    def list_models(self, provider_id: str) -> Dict[str, Any]:
+        """List available models from a provider.
+
+        Args:
+            provider_id: Provider ID
+
+        Returns:
+            Result with models list or error
+        """
+        provider = self._providers.get(provider_id)
+        if not provider:
+            return {
+                "success": False,
+                "error": f"Provider '{provider_id}' not found",
+            }
+
+        import urllib.request
+        import urllib.error
+
+        try:
+            url = f"{provider.base_url}{provider.models_path}"
+            req = urllib.request.Request(url, method="GET")
+            req.add_header("Accept", "application/json")
+
+            if provider.api_key:
+                req.add_header("Authorization", f"Bearer {provider.api_key}")
+
+            with urllib.request.urlopen(req, timeout=provider.timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+
+                # Extract models (handle different response formats)
+                models = []
+                if "data" in data:
+                    models = [m.get("id", m.get("name", "")) for m in data["data"]]
+                elif "models" in data:
+                    models = [m.get("name", m.get("id", "")) for m in data["models"]]
+
+                return {
+                    "success": True,
+                    "models": models,
+                    "count": len(models),
+                }
+
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+            }
+
+
+# Global instance
+_provider_manager: Optional[ProviderConfigManager] = None
+
+
+def get_provider_manager() -> ProviderConfigManager:
+    """Get the global provider config manager."""
+    global _provider_manager
+    if _provider_manager is None:
+        _provider_manager = ProviderConfigManager()
+    return _provider_manager
