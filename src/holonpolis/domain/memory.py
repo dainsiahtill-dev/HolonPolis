@@ -16,6 +16,7 @@ class MemoryKind(Enum):
     SKILL_USAGE = "skill_usage"  # How a skill was used
     EVOLUTION = "evolution"  # Evolution attempt result
     ROUTE_EXPERIENCE = "route_experience"  # Routing decision outcome
+    SKILL = "skill"  # Evolved skill code
 
 
 @dataclass

@@ -158,15 +158,12 @@ class RepositoryLearner:
             )
 
     async def _fetch_repository(self, repo_url: str, branch: str) -> Optional[Path]:
-        """获取仓库到临时目录。支持 URL 或本地路径。"""
+        """获取仓库到临时目录。支持 URL 或本地路径（包括非 git 目录）。"""
         # 检查是否是本地路径
         local_path = Path(repo_url)
         if local_path.exists() and local_path.is_dir():
-            # 检查是否是 git 仓库
-            if (local_path / ".git").exists():
-                return local_path
-            else:
-                raise ValueError(f"Local path is not a git repository: {repo_url}")
+            # 支持非 git 目录的直接学习
+            return local_path
 
         # 验证 URL
         parsed = urlparse(repo_url)
