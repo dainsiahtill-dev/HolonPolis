@@ -134,3 +134,97 @@ async def get_holon_memories(
         memories = []
 
     return memories
+
+
+class LearnRepositoryRequest(BaseModel):
+    """Request to learn from a repository."""
+    repo_url: str
+    branch: str = "main"
+    depth: int = 3
+    focus_areas: List[str] = []
+
+
+class LearnRepositoryResponse(BaseModel):
+    """Response from learning a repository."""
+    success: bool
+    holon_id: str
+    repo_url: str
+    repo_name: str
+    languages: dict
+    total_files: int
+    total_lines: int
+    key_patterns: List[str]
+    architecture: str
+    learnings: List[str]
+    memories_created: int
+    message: str
+
+
+@router.post("/{holon_id}/learn-repository", response_model=LearnRepositoryResponse)
+async def learn_repository(
+    holon_id: str,
+    request: LearnRepositoryRequest,
+) -> LearnRepositoryResponse:
+    """让 Holon 学习指定的代码仓库。
+
+    示例:
+    ```json
+    {
+        "repo_url": "https://github.com/vuejs/core",
+        "branch": "main",
+        "depth": 3,
+        "focus_areas": ["architecture", "patterns", "testing"]
+    }
+    ```
+    """
+    from holonpolis.services.repository_learner import RepositoryLearningService
+
+    service = RepositoryLearningService()
+
+    # 检查 Holon 是否存在
+    holon_svc = HolonService()
+    if not holon_svc.holon_exists(holon_id):
+        raise HTTPException(status_code=404, detail="Holon not found")
+
+    try:
+        result = await service.learn(
+            holon_id=holon_id,
+            repo_url=request.repo_url,
+            branch=request.branch,
+            depth=request.depth,
+            focus_areas=request.focus_areas or None,
+        )
+
+        if result.success and result.analysis:
+            return LearnRepositoryResponse(
+                success=True,
+                holon_id=holon_id,
+                repo_url=request.repo_url,
+                repo_name=result.analysis.repo_name,
+                languages=result.analysis.languages,
+                total_files=result.analysis.total_files,
+                total_lines=result.analysis.total_lines,
+                key_patterns=result.analysis.key_patterns,
+                architecture=result.analysis.architecture,
+                learnings=result.analysis.learnings,
+                memories_created=result.memories_created,
+                message=f"Successfully learned {result.analysis.repo_name}",
+            )
+        else:
+            return LearnRepositoryResponse(
+                success=False,
+                holon_id=holon_id,
+                repo_url=request.repo_url,
+                repo_name="",
+                languages={},
+                total_files=0,
+                total_lines=0,
+                key_patterns=[],
+                architecture="",
+                learnings=[],
+                memories_created=0,
+                message=result.error_message or "Learning failed",
+            )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

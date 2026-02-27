@@ -12,6 +12,12 @@ from .evolution_service import (
     EvolutionService,
     SecurityScanner,
 )
+from .repository_learner import (
+    RepositoryLearner,
+    RepositoryLearningService,
+    LearningResult,
+    RepositoryAnalysis,
+)
 
 __all__ = [
     "MemoryService",
@@ -22,4 +28,8 @@ __all__ = [
     "SecurityScanner",
     "Attestation",
     "EvolutionResult",
+    "RepositoryLearner",
+    "RepositoryLearningService",
+    "LearningResult",
+    "RepositoryAnalysis",
 ]
