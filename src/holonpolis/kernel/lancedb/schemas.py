@@ -2,24 +2,27 @@
 
 import pyarrow as pa
 
+DEFAULT_EMBEDDING_DIMENSION = 1536
 
-# Schema for memories table (retrievable condensed memories)
-MEMORIES_SCHEMA = pa.schema([
-    pa.field("memory_id", pa.string(), nullable=False),
-    pa.field("holon_id", pa.string(), nullable=False),
-    pa.field("kind", pa.string(), nullable=False),  # MemoryKind value
-    pa.field("content", pa.string(), nullable=False),
-    pa.field("embedding", pa.list_(pa.float32()), nullable=False),
-    pa.field("tags", pa.list_(pa.string()), nullable=False),
-    pa.field("importance", pa.float32(), nullable=False),
-    pa.field("success_score", pa.float32(), nullable=True),
-    pa.field("source_episode_id", pa.string(), nullable=True),
-    pa.field("source_skill", pa.string(), nullable=True),
-    pa.field("created_at", pa.string(), nullable=False),
-    pa.field("last_accessed_at", pa.string(), nullable=True),
-    pa.field("access_count", pa.int32(), nullable=False),
-    pa.field("decay_factor", pa.float32(), nullable=False),
-])
+
+def build_memories_schema(embedding_dimension: int = DEFAULT_EMBEDDING_DIMENSION) -> pa.Schema:
+    """Build memories table schema with fixed-size vectors."""
+    return pa.schema([
+        pa.field("memory_id", pa.string(), nullable=False),
+        pa.field("holon_id", pa.string(), nullable=False),
+        pa.field("kind", pa.string(), nullable=False),  # MemoryKind value
+        pa.field("content", pa.string(), nullable=False),
+        pa.field("embedding", pa.list_(pa.float32(), embedding_dimension), nullable=False),
+        pa.field("tags", pa.list_(pa.string()), nullable=False),
+        pa.field("importance", pa.float32(), nullable=False),
+        pa.field("success_score", pa.float32(), nullable=True),
+        pa.field("source_episode_id", pa.string(), nullable=True),
+        pa.field("source_skill", pa.string(), nullable=True),
+        pa.field("created_at", pa.string(), nullable=False),
+        pa.field("last_accessed_at", pa.string(), nullable=True),
+        pa.field("access_count", pa.int32(), nullable=False),
+        pa.field("decay_factor", pa.float32(), nullable=False),
+    ])
 
 
 # Schema for episodes table (full interaction records)
@@ -38,36 +41,42 @@ EPISODES_SCHEMA = pa.schema([
 ])
 
 
-# Schema for Genesis holons table (index of all holons)
-GENESIS_HOLONS_SCHEMA = pa.schema([
-    pa.field("holon_id", pa.string(), nullable=False),
-    pa.field("blueprint_id", pa.string(), nullable=False),
-    pa.field("species_id", pa.string(), nullable=False),
-    pa.field("name", pa.string(), nullable=False),
-    pa.field("purpose", pa.string(), nullable=False),
-    pa.field("status", pa.string(), nullable=False),  # active, frozen, archived
-    pa.field("capabilities", pa.list_(pa.string()), nullable=False),
-    pa.field("skills", pa.list_(pa.string()), nullable=False),
-    pa.field("total_episodes", pa.int32(), nullable=False),
-    pa.field("success_rate", pa.float32(), nullable=False),
-    pa.field("last_active_at", pa.string(), nullable=True),
-    pa.field("created_at", pa.string(), nullable=False),
-    pa.field("embedding", pa.list_(pa.float32()), nullable=False),  # Purpose embedding
-])
+def build_genesis_holons_schema(
+    embedding_dimension: int = DEFAULT_EMBEDDING_DIMENSION,
+) -> pa.Schema:
+    """Build genesis holons schema with fixed-size vectors."""
+    return pa.schema([
+        pa.field("holon_id", pa.string(), nullable=False),
+        pa.field("blueprint_id", pa.string(), nullable=False),
+        pa.field("species_id", pa.string(), nullable=False),
+        pa.field("name", pa.string(), nullable=False),
+        pa.field("purpose", pa.string(), nullable=False),
+        pa.field("status", pa.string(), nullable=False),  # active, frozen, archived
+        pa.field("capabilities", pa.list_(pa.string()), nullable=False),
+        pa.field("skills", pa.list_(pa.string()), nullable=False),
+        pa.field("total_episodes", pa.int32(), nullable=False),
+        pa.field("success_rate", pa.float32(), nullable=False),
+        pa.field("last_active_at", pa.string(), nullable=True),
+        pa.field("created_at", pa.string(), nullable=False),
+        pa.field("embedding", pa.list_(pa.float32(), embedding_dimension), nullable=False),
+    ])
 
 
-# Schema for Genesis routes table (routing history)
-GENESIS_ROUTES_SCHEMA = pa.schema([
-    pa.field("route_id", pa.string(), nullable=False),
-    pa.field("query", pa.string(), nullable=False),
-    pa.field("query_embedding", pa.list_(pa.float32()), nullable=False),
-    pa.field("decision", pa.string(), nullable=False),  # route_to, spawn, deny, clarify
-    pa.field("target_holon_id", pa.string(), nullable=True),
-    pa.field("spawned_blueprint_id", pa.string(), nullable=True),
-    pa.field("reasoning", pa.string(), nullable=False),
-    pa.field("outcome", pa.string(), nullable=True),  # success, failure, pending
-    pa.field("created_at", pa.string(), nullable=False),
-])
+def build_genesis_routes_schema(
+    embedding_dimension: int = DEFAULT_EMBEDDING_DIMENSION,
+) -> pa.Schema:
+    """Build genesis routes schema with fixed-size vectors."""
+    return pa.schema([
+        pa.field("route_id", pa.string(), nullable=False),
+        pa.field("query", pa.string(), nullable=False),
+        pa.field("query_embedding", pa.list_(pa.float32(), embedding_dimension), nullable=False),
+        pa.field("decision", pa.string(), nullable=False),  # route_to, spawn, deny, clarify
+        pa.field("target_holon_id", pa.string(), nullable=True),
+        pa.field("spawned_blueprint_id", pa.string(), nullable=True),
+        pa.field("reasoning", pa.string(), nullable=False),
+        pa.field("outcome", pa.string(), nullable=True),  # success, failure, pending
+        pa.field("created_at", pa.string(), nullable=False),
+    ])
 
 
 # Schema for Genesis evolutions table (evolution tracking)
@@ -84,3 +93,9 @@ GENESIS_EVOLUTIONS_SCHEMA = pa.schema([
     pa.field("created_at", pa.string(), nullable=False),
     pa.field("completed_at", pa.string(), nullable=True),
 ])
+
+
+# Default schemas kept for compatibility with existing imports.
+MEMORIES_SCHEMA = build_memories_schema()
+GENESIS_HOLONS_SCHEMA = build_genesis_holons_schema()
+GENESIS_ROUTES_SCHEMA = build_genesis_routes_schema()

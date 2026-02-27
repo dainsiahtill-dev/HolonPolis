@@ -7,7 +7,6 @@ Creates:
 """
 
 import json
-from pathlib import Path
 
 import structlog
 
@@ -23,7 +22,8 @@ def bootstrap():
     This should be called once at application startup.
     It's safe to call multiple times (idempotent).
     """
-    logger.info("bootstrapping_holonpolis")
+    settings.setup_logging()
+    logger.info("bootstrapping_holonpolis", root=str(settings.holonpolis_root))
 
     # 1. Ensure directory structure
     settings.ensure_directories()
@@ -40,7 +40,7 @@ def bootstrap():
 
 def _init_default_species():
     """Initialize default species definitions."""
-    species_path = settings.holonpolis_root / "species"
+    species_path = settings.species_path
     species_path.mkdir(exist_ok=True)
 
     # Generalist species

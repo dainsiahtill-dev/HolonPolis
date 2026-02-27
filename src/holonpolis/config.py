@@ -3,7 +3,21 @@
 from pathlib import Path
 from typing import Optional
 
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from holonpolis.infrastructure.config.settings_utils import (
+    env_bool,
+    env_int,
+    env_list,
+    env_str,
+)
+from holonpolis.infrastructure.logging_setup import configure_logging
+from holonpolis.infrastructure.storage.path_guard import (
+    ensure_within_root,
+    normalize_path,
+    safe_join,
+)
 
 
 class Settings(BaseSettings):
@@ -15,15 +29,30 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Paths
-    holonpolis_root: Path = Path(".holonpolis")
-    genesis_memory_path: Path = Path(".holonpolis/genesis/memory/lancedb")
-    holons_path: Path = Path(".holonpolis/holons")
-    global_skills_path: Path = Path(".holonpolis/skills_global")
-    attestations_path: Path = Path(".holonpolis/attestations")
-    runs_path: Path = Path(".holonpolis/runs")
+    # Rooted runtime paths (all must remain inside holonpolis_root)
+    holonpolis_root: Path = Field(default=Path(".holonpolis"))
+    genesis_memory_path: Path = Field(default=Path("genesis/memory/lancedb"))
+    holons_path: Path = Field(default=Path("holons"))
+    global_skills_path: Path = Field(default=Path("skills_global"))
+    attestations_path: Path = Field(default=Path("attestations"))
+    runs_path: Path = Field(default=Path("runs"))
+    blueprint_cache_path: Path = Field(default=Path("genesis/blueprint_cache"))
+    index_path: Path = Field(default=Path("index"))
+    species_path: Path = Field(default=Path("species"))
 
-    # LLM Configuration
+    # Server/observability
+    api_host: str = Field(default_factory=lambda: env_str("HOLONPOLIS_HOST", "0.0.0.0"))
+    api_port: int = Field(
+        default_factory=lambda: env_int("HOLONPOLIS_PORT", 8000, minimum=1, maximum=65535)
+    )
+    api_reload: bool = Field(default_factory=lambda: env_bool("HOLONPOLIS_RELOAD", True))
+    log_level: str = Field(default_factory=lambda: env_str("HOLONPOLIS_LOG_LEVEL", "INFO"))
+    log_json: bool = Field(default_factory=lambda: env_bool("HOLONPOLIS_LOG_JSON", False))
+    cors_origins: list[str] = Field(
+        default_factory=lambda: env_list("HOLONPOLIS_CORS_ORIGINS", default=["*"])
+    )
+
+    # LLM configuration
     llm_provider: str = "openai"  # openai, local, etc.
     openai_api_key: Optional[str] = None
     openai_base_url: Optional[str] = None
@@ -31,39 +60,89 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.7
     llm_max_tokens: int = 4096
 
-    # Embedding Configuration
+    # Embedding configuration
     embedding_provider: str = "openai"
     embedding_model: str = "text-embedding-3-small"
     embedding_dimension: int = 1536
 
-    # Sandbox Configuration
+    # Sandbox configuration
     sandbox_timeout_seconds: int = 60
     sandbox_max_memory_mb: int = 512
     sandbox_enable_network: bool = False
 
-    # Memory Configuration
+    # Memory configuration
     memory_default_top_k: int = 5
     memory_decay_enabled: bool = True
     memory_importance_threshold: float = 0.5
 
-    # Evolution Configuration
+    # Evolution configuration
     evolution_max_attempts: int = 3
     evolution_pytest_timeout: int = 30
 
+    def _resolve_under_root(self, value: Path) -> Path:
+        root = normalize_path(self.holonpolis_root)
+        raw = Path(value)
+        if raw.is_absolute():
+            try:
+                return ensure_within_root(root, raw)
+            except ValueError:
+                parts = list(raw.parts)
+                normalized_parts = [part.lower() for part in parts]
+                if ".holonpolis" in normalized_parts:
+                    idx = normalized_parts.index(".holonpolis")
+                    suffix = parts[idx + 1 :]
+                    if not suffix:
+                        return root
+                    return safe_join(root, *suffix)
+                raise
+
+        normalized = str(raw).replace("\\", "/")
+        if normalized == ".holonpolis":
+            return root
+        if normalized.startswith(".holonpolis/"):
+            raw = Path(normalized[len(".holonpolis/") :])
+
+        if not raw.parts:
+            return root
+        return safe_join(root, *raw.parts)
+
+    def _normalize_runtime_paths(self) -> None:
+        self.holonpolis_root = normalize_path(self.holonpolis_root)
+
+        self.genesis_memory_path = self._resolve_under_root(self.genesis_memory_path)
+        self.holons_path = self._resolve_under_root(self.holons_path)
+        self.global_skills_path = self._resolve_under_root(self.global_skills_path)
+        self.attestations_path = self._resolve_under_root(self.attestations_path)
+        self.runs_path = self._resolve_under_root(self.runs_path)
+        self.blueprint_cache_path = self._resolve_under_root(self.blueprint_cache_path)
+        self.index_path = self._resolve_under_root(self.index_path)
+        self.species_path = self._resolve_under_root(self.species_path)
+
+    @model_validator(mode="after")
+    def _normalize_paths_validator(self) -> "Settings":
+        self._normalize_runtime_paths()
+        return self
+
+    def setup_logging(self) -> None:
+        configure_logging(level=self.log_level, json_logs=self.log_json)
+
     def ensure_directories(self) -> None:
         """Ensure all required directories exist."""
-        dirs = [
+        self._normalize_runtime_paths()
+
+        required = [
             self.holonpolis_root,
             self.genesis_memory_path,
             self.holons_path,
             self.global_skills_path,
             self.attestations_path,
             self.runs_path,
-            Path(".holonpolis/genesis/blueprint_cache"),
-            Path(".holonpolis/index"),
+            self.blueprint_cache_path,
+            self.index_path,
+            self.species_path,
         ]
-        for d in dirs:
-            d.mkdir(parents=True, exist_ok=True)
+        for path in required:
+            path.mkdir(parents=True, exist_ok=True)
 
 
 # Global settings instance

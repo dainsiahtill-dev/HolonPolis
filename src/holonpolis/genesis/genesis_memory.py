@@ -104,7 +104,7 @@ class GenesisMemory:
         task_embedding = await self.embedder.embed_single(task_description)
 
         # Search by purpose embedding
-        results = table.search(task_embedding).limit(top_k).to_list()
+        results = table.search(task_embedding, vector_column_name="embedding").limit(top_k).to_list()
 
         return [
             {

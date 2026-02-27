@@ -14,6 +14,7 @@ import structlog
 from holonpolis.config import settings
 from holonpolis.domain import Blueprint
 from holonpolis.domain.errors import HolonNotFoundError
+from holonpolis.infrastructure.storage.path_guard import safe_join, validate_holon_id
 from holonpolis.kernel.lancedb.lancedb_factory import get_lancedb_factory
 
 logger = structlog.get_logger()
@@ -35,7 +36,8 @@ class HolonService:
 
     def _get_holon_path(self, holon_id: str) -> Path:
         """Get the base path for a Holon."""
-        return self.holons_path / holon_id
+        safe_holon_id = validate_holon_id(holon_id)
+        return safe_join(self.holons_path, safe_holon_id)
 
     def _get_blueprint_path(self, holon_id: str) -> Path:
         """Get the blueprint.json path for a Holon."""

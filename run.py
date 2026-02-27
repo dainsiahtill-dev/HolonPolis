@@ -3,11 +3,14 @@
 
 import uvicorn
 
+from holonpolis.config import settings
+
 if __name__ == "__main__":
+    settings.setup_logging()
     uvicorn.run(
         "holonpolis.api.main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
-        log_level="info",
+        host=settings.api_host,
+        port=settings.api_port,
+        reload=settings.api_reload,
+        log_level=settings.log_level.lower(),
     )

@@ -115,12 +115,21 @@ def get_embedder() -> EmbeddingProvider:
     """Get the global embedder."""
     global _embedder
     if _embedder is None:
-        # Try OpenAI first, fallback to simple
-        try:
-            _embedder = OpenAIEmbedder()
-        except ValueError:
-            logger.warning("openai_not_configured_using_simple_embedder")
-            _embedder = SimpleEmbedder()
+        from holonpolis.config import settings
+
+        if settings.embedding_provider.lower() == "openai":
+            api_key = settings.openai_api_key or os.environ.get("OPENAI_API_KEY")
+            if api_key:
+                _embedder = OpenAIEmbedder(
+                    model=settings.embedding_model,
+                    api_key=api_key,
+                    base_url=settings.openai_base_url,
+                )
+            else:
+                logger.warning("openai_not_configured_using_simple_embedder")
+                _embedder = SimpleEmbedder(dimension=settings.embedding_dimension)
+        else:
+            _embedder = SimpleEmbedder(dimension=settings.embedding_dimension)
     return _embedder
 
 

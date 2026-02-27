@@ -4,21 +4,22 @@ Key constraint: Each Holon has its own independent LanceDB directory.
 Genesis has its own separate LanceDB directory.
 """
 
-import asyncio
 import threading
 from pathlib import Path
-from typing import Dict, Optional, Any
-from contextlib import contextmanager
+from typing import Any, Dict, Optional
 
 import lancedb
 import structlog
 
+from holonpolis.infrastructure.storage.path_guard import safe_join, validate_holon_id
+
 from .schemas import (
     EPISODES_SCHEMA,
+    DEFAULT_EMBEDDING_DIMENSION,
     GENESIS_EVOLUTIONS_SCHEMA,
-    GENESIS_HOLONS_SCHEMA,
-    GENESIS_ROUTES_SCHEMA,
-    MEMORIES_SCHEMA,
+    build_genesis_holons_schema,
+    build_genesis_routes_schema,
+    build_memories_schema,
 )
 
 logger = structlog.get_logger()
@@ -56,11 +57,14 @@ class LanceDBConnection:
 
     def table_exists(self, name: str) -> bool:
         """Check if a table exists."""
-        return name in self.connection.table_names()
+        return name in self.list_tables()
 
     def list_tables(self) -> list:
         """List all table names."""
-        return self.connection.table_names()
+        response = self.connection.list_tables()
+        if hasattr(response, "tables"):
+            return list(response.tables)
+        return list(response)
 
 
 class LanceDBFactory:
@@ -69,8 +73,9 @@ class LanceDBFactory:
     Enforces the rule: Each holon_id maps to exactly one independent database.
     """
 
-    def __init__(self, base_path: Path):
+    def __init__(self, base_path: Path, embedding_dimension: int = DEFAULT_EMBEDDING_DIMENSION):
         self.base_path = Path(base_path)
+        self.embedding_dimension = int(embedding_dimension)
         self._cache: Dict[str, LanceDBConnection] = {}
         self._lock = threading.RLock()
 
@@ -81,10 +86,10 @@ class LanceDBFactory:
         - "genesis" -> .holonpolis/genesis/memory/lancedb/
         - regular holon -> .holonpolis/holons/{holon_id}/memory/lancedb/
         """
-        if holon_id == "genesis":
-            return self.base_path / "genesis" / "memory" / "lancedb"
-        else:
-            return self.base_path / "holons" / holon_id / "memory" / "lancedb"
+        safe_holon_id = validate_holon_id(holon_id)
+        if safe_holon_id == "genesis":
+            return safe_join(self.base_path, "genesis", "memory", "lancedb")
+        return safe_join(self.base_path, "holons", safe_holon_id, "memory", "lancedb")
 
     def open(self, holon_id: str) -> LanceDBConnection:
         """Open a LanceDB connection for the given holon.
@@ -143,7 +148,11 @@ class LanceDBFactory:
         conn = self.open(holon_id)
 
         # Create memories table
-        conn.create_table("memories", MEMORIES_SCHEMA, exist_ok=True)
+        conn.create_table(
+            "memories",
+            build_memories_schema(self.embedding_dimension),
+            exist_ok=True,
+        )
 
         # Create episodes table
         conn.create_table("episodes", EPISODES_SCHEMA, exist_ok=True)
@@ -161,10 +170,18 @@ class LanceDBFactory:
         conn = self.open("genesis")
 
         # Create holons registry table
-        conn.create_table("holons", GENESIS_HOLONS_SCHEMA, exist_ok=True)
+        conn.create_table(
+            "holons",
+            build_genesis_holons_schema(self.embedding_dimension),
+            exist_ok=True,
+        )
 
         # Create routes table
-        conn.create_table("routes", GENESIS_ROUTES_SCHEMA, exist_ok=True)
+        conn.create_table(
+            "routes",
+            build_genesis_routes_schema(self.embedding_dimension),
+            exist_ok=True,
+        )
 
         # Create evolutions table
         conn.create_table("evolutions", GENESIS_EVOLUTIONS_SCHEMA, exist_ok=True)
@@ -205,7 +222,9 @@ def get_lancedb_factory(base_path: Optional[Path] = None) -> LanceDBFactory:
             from holonpolis.config import settings
             base_path = settings.holonpolis_root
 
-        _factory = LanceDBFactory(base_path)
+        from holonpolis.kernel.embeddings.default_embedder import get_embedder
+
+        _factory = LanceDBFactory(base_path, embedding_dimension=get_embedder().dimension)
         return _factory
 
 

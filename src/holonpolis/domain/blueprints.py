@@ -88,7 +88,7 @@ class Blueprint:
                 "allow_file_write": self.boundary.allow_file_write,
                 "allow_network": self.boundary.allow_network,
                 "allow_subprocess": self.boundary.allow_subprocess,
-                "workspace_path": self.workspace_path,
+                "workspace_path": self.boundary.workspace_path,
             },
             "evolution_policy": {
                 "strategy": self.evolution_policy.strategy.value,

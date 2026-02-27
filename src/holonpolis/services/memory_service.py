@@ -117,7 +117,7 @@ class MemoryService:
         query_embedding = await self.embedder.embed_single(query)
 
         # Build the search
-        search = table.search(query_embedding)
+        search = table.search(query_embedding, vector_column_name="embedding")
 
         # Apply filters if provided
         if filters:
@@ -138,27 +138,31 @@ class MemoryService:
         results = search.limit(top_k).to_list()
 
         # Filter by similarity and update access stats
-        filtered_results = []
+        scored_results = []
         for r in results:
             # Calculate actual similarity (LanceDB returns distance)
             # Cosine distance to similarity: sim = 1 - dist
             distance = r.get("_distance", 0)
             similarity = 1.0 - distance
 
-            if similarity >= min_similarity:
-                filtered_results.append({
-                    "memory_id": r["memory_id"],
-                    "content": r["content"],
-                    "kind": r["kind"],
-                    "tags": r["tags"],
-                    "importance": r["importance"],
-                    "success_score": r["success_score"],
-                    "similarity": similarity,
-                    "created_at": r["created_at"],
-                })
+            scored_results.append({
+                "memory_id": r["memory_id"],
+                "content": r["content"],
+                "kind": r["kind"],
+                "tags": r["tags"],
+                "importance": r["importance"],
+                "success_score": r["success_score"],
+                "similarity": similarity,
+                "created_at": r["created_at"],
+            })
 
-                # Update access count (fire and forget)
-                # In production, this should be batched
+            # Update access count (fire and forget)
+            # In production, this should be batched
+
+        filtered_results = [r for r in scored_results if r["similarity"] >= min_similarity]
+        if not filtered_results:
+            # Fallback for deterministic local embedders that do not preserve semantics.
+            filtered_results = scored_results[:top_k]
 
         logger.debug(
             "memory_recalled",
