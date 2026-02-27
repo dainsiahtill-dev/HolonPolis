@@ -53,10 +53,33 @@ class Settings(BaseSettings):
     )
 
     # LLM configuration
-    llm_provider: str = "openai"  # openai, local, etc.
+    llm_provider: str = Field(
+        default_factory=lambda: env_str("HOLONPOLIS_LLM_DEFAULT_PROVIDER", "openai")
+    )
     openai_api_key: Optional[str] = None
     openai_base_url: Optional[str] = None
     openai_model: str = "gpt-4o-mini"
+    ollama_base_url: str = Field(
+        default_factory=lambda: env_str("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+    )
+    ollama_model: str = Field(default_factory=lambda: env_str("OLLAMA_MODEL", "qwen2.5-coder:14b"))
+    anthropic_api_key: Optional[str] = None
+    anthropic_base_url: str = Field(
+        default_factory=lambda: env_str("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1")
+    )
+    anthropic_model: str = Field(
+        default_factory=lambda: env_str("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest")
+    )
+    kimi_api_key: Optional[str] = None
+    kimi_base_url: str = Field(
+        default_factory=lambda: env_str("KIMI_BASE_URL", "https://api.moonshot.cn/v1")
+    )
+    kimi_model: str = Field(default_factory=lambda: env_str("KIMI_MODEL", "moonshot-v1-8k"))
+    gemini_api_key: Optional[str] = None
+    gemini_base_url: str = Field(
+        default_factory=lambda: env_str("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com")
+    )
+    gemini_model: str = Field(default_factory=lambda: env_str("GEMINI_MODEL", "gemini-1.5-pro"))
     llm_temperature: float = 0.7
     llm_max_tokens: int = 4096
 

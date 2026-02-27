@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 
 import structlog
 
+from holonpolis.config import settings
 from holonpolis.domain import Blueprint
 from holonpolis.domain.memory import MemoryKind
 from holonpolis.kernel.llm.llm_runtime import LLMConfig, LLMMessage, get_llm_runtime
@@ -122,9 +123,13 @@ class HolonRuntime:
 
         # 3. Call LLM
         config = LLMConfig(
-            model="gpt-4o-mini",
-            temperature=0.7,
-            max_tokens=self.blueprint.boundary.max_tokens_per_episode,
+            provider_id=settings.llm_provider,
+            model=settings.openai_model,
+            temperature=settings.llm_temperature,
+            max_tokens=min(
+                self.blueprint.boundary.max_tokens_per_episode,
+                settings.llm_max_tokens,
+            ),
         )
 
         try:

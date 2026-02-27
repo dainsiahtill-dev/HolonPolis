@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Union
 
 import structlog
 
+from holonpolis.config import settings
 from holonpolis.domain import Blueprint, Boundary, EvolutionPolicy
 from holonpolis.domain.blueprints import EvolutionStrategy
 from holonpolis.kernel.llm.llm_runtime import LLMConfig, LLMMessage, get_llm_runtime
@@ -113,9 +114,10 @@ class EvolutionLord:
         )
 
         config = LLMConfig(
-            model="gpt-4o-mini",  # Can be configured
+            provider_id=settings.llm_provider,
+            model=settings.openai_model,
             temperature=0.3,  # Lower for more deterministic decisions
-            max_tokens=2048,
+            max_tokens=min(2048, settings.llm_max_tokens),
         )
 
         try:
