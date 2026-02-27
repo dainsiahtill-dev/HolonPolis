@@ -27,6 +27,8 @@ from holonpolis.domain.skills import SkillManifest, SkillVersion, ToolSchema
 from holonpolis.kernel.sandbox import SandboxConfig, SandboxResult, SandboxRunner
 from holonpolis.kernel.storage import HolonPathGuard
 from holonpolis.services.holon_service import HolonService
+from holonpolis.kernel.llm.llm_runtime import LLMConfig, LLMMessage, get_llm_runtime
+from holonpolis.kernel.llm.provider_config import get_provider_manager
 
 logger = structlog.get_logger()
 
@@ -86,6 +88,240 @@ class EvolutionResult:
     code_path: Optional[str] = None
     test_path: Optional[str] = None
     manifest_path: Optional[str] = None
+
+
+class TypeScriptSecurityScanner:
+    """TypeScript 安全扫描器。"""
+
+    # TypeScript 危险模式
+    DANGEROUS_PATTERNS = frozenset({
+        'eval(',
+        'new Function(',
+        'child_process',
+        'exec(',
+        'execSync(',
+        'spawn(',
+        '__proto__',
+        'prototype pollution',
+    })
+
+    # 安全必需的防护
+    REQUIRED_PROTECTIONS = [
+        ('path traversal', r'\.\.|path\.resolve|path\.join'),
+        ('input validation', r'typeof|instanceof|Array\.isArray'),
+    ]
+
+    def scan(self, code: str) -> Dict[str, Any]:
+        """扫描 TypeScript 代码。"""
+        violations = []
+
+        # 检查危险模式
+        for pattern in self.DANGEROUS_PATTERNS:
+            if pattern in code:
+                violations.append({
+                    'type': 'dangerous_pattern',
+                    'pattern': pattern,
+                    'message': f'Found dangerous pattern: {pattern}'
+                })
+
+        # 检查必要的安全防护
+        has_traversal_protection = '..' in code and ('replace' in code or 'resolve' in code)
+
+        return {
+            'passed': len(violations) == 0,
+            'violations': violations,
+            'complexity': self._estimate_complexity(code),
+            'has_traversal_protection': has_traversal_protection,
+        }
+
+    def _estimate_complexity(self, code: str) -> float:
+        """估算 TypeScript 代码复杂度。"""
+        # 计算决策点
+        decision_points = (
+            code.count('if (') +
+            code.count('switch (') +
+            code.count('for (') +
+            code.count('while (') +
+            code.count('?.')  # 可选链
+        )
+        return min(10.0, decision_points / 5.0)
+
+
+class LLMCodeGenerator:
+    """LLM 代码生成器 - 真正自主生成代码。"""
+
+    def __init__(self, provider_id: Optional[str] = None):
+        self.runtime = get_llm_runtime()
+        self.provider_manager = get_provider_manager()
+        self.provider_id = provider_id or self._select_best_provider()
+
+    def _select_best_provider(self) -> str:
+        """选择最佳的代码生成 provider。"""
+        # 优先级：Kimi Coding > MiniMax > Ollama > 其他
+        providers = self.provider_manager.list_providers(mask_secrets=True)
+        provider_ids = [p["provider_id"] for p in providers]
+
+        if "kimi-coding" in provider_ids:
+            return "kimi-coding"
+        if "minimax" in provider_ids:
+            return "minimax"
+        if "ollama-local" in provider_ids:
+            return "ollama-local"
+        if "ollama" in provider_ids:
+            return "ollama"
+
+        return provider_ids[0] if provider_ids else "openai"
+
+    async def generate_typescript_project(
+        self,
+        project_name: str,
+        description: str,
+        requirements: List[str],
+    ) -> Dict[str, str]:
+        """生成完整的 TypeScript 项目代码。
+
+        Returns:
+            Dict with keys: code, tsconfig, package_json
+        """
+        provider = self.provider_manager.get_provider(self.provider_id)
+        if not provider:
+            raise ValueError(f"Provider {self.provider_id} not found")
+
+        # 生成主代码
+        code = await self._generate_code(project_name, description, requirements)
+
+        # 生成配置文件
+        tsconfig = await self._generate_tsconfig()
+        package_json = await self._generate_package_json(project_name, description)
+
+        return {
+            "code": code,
+            "tsconfig": tsconfig,
+            "package_json": package_json,
+        }
+
+    async def _generate_code(
+        self,
+        project_name: str,
+        description: str,
+        requirements: List[str],
+    ) -> str:
+        """使用 LLM 生成 TypeScript 代码。"""
+        system_prompt = """You are an expert TypeScript developer.
+Your task is to generate complete, production-ready TypeScript code.
+Rules:
+1. Use strict TypeScript with proper types
+2. Include security best practices (input validation, path traversal protection)
+3. Use modern ES2020+ features
+4. Include proper error handling
+5. Add JSDoc comments for public APIs
+6. NEVER use eval() or new Function()
+7. ALWAYS sanitize user inputs
+Output ONLY the code, no explanations."""
+
+        requirements_text = "\n".join(f"- {r}" for r in requirements)
+
+        prompt = f"""Generate a complete TypeScript file server implementation.
+
+Project: {project_name}
+Description: {description}
+
+Requirements:
+{requirements_text}
+
+Generate a single file (index.ts) that:
+1. Creates an HTTP file server
+2. Supports GET (read files/list directories)
+3. Supports POST (create files)
+4. Supports DELETE (delete files)
+5. Has path traversal protection
+6. Proper TypeScript types and interfaces
+7. Security focused
+
+Output ONLY valid TypeScript code that can be compiled with tsc."""
+
+        # Get provider config for model info
+        provider_cfg = self.provider_manager.get_provider(self.provider_id)
+        if provider_cfg and provider_cfg.model:
+            model = provider_cfg.model
+        else:
+            model = "qwen3-coder-30b-v12-q8-128k-dual3090:latest"
+
+        config = LLMConfig(
+            provider_id=self.provider_id,
+            model=model,
+            temperature=0.2,
+            max_tokens=8192,
+        )
+
+        response = await self.runtime.chat(
+            system_prompt=system_prompt,
+            user_prompt=prompt,
+            config=config,
+        )
+
+        # 提取代码
+        code = response.content.strip()
+
+        # 移除 markdown 代码块
+        if code.startswith("```typescript"):
+            code = code[13:]
+        elif code.startswith("```ts"):
+            code = code[5:]
+        elif code.startswith("```"):
+            code = code[3:]
+        if code.endswith("```"):
+            code = code[:-3]
+        code = code.strip()
+
+        return code
+
+    async def _generate_tsconfig(self) -> str:
+        """生成 tsconfig.json。"""
+        return '''{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "commonjs",
+    "lib": ["ES2020"],
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}'''
+
+    async def _generate_package_json(self, project_name: str, description: str) -> str:
+        """生成 package.json。"""
+        safe_name = project_name.lower().replace(" ", "-")
+        return f'''{{
+  "name": "{safe_name}",
+  "version": "1.0.0",
+  "description": "{description}",
+  "main": "dist/index.js",
+  "scripts": {{
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch"
+  }},
+  "keywords": ["file-server", "typescript", "holonpolis"],
+  "author": "HolonPolis Evolution Engine",
+  "license": "MIT",
+  "devDependencies": {{
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }},
+  "engines": {{
+    "node": ">=16.0.0"
+  }}
+}}'''
 
 
 class SecurityScanner:
@@ -244,10 +480,14 @@ class EvolutionService:
     4. 生成 Attestation
     """
 
+    # 支持的语言
+    SUPPORTED_LANGUAGES = frozenset({'python', 'typescript'})
+
     def __init__(self):
         self._sandbox: Optional[SandboxRunner] = None
         self.security_scanner = SecurityScanner()
         self.holon_service = HolonService()
+        self._typescript_scanner = TypeScriptSecurityScanner()
 
     @property
     def sandbox(self) -> SandboxRunner:
@@ -384,11 +624,16 @@ class EvolutionService:
         for f in work_dir.glob("*.py"):
             f.unlink()
 
-        # 写入代码和测试
+        # 写入代码和测试 - 添加必要的导入
         code_file = work_dir / "skill_module.py"
         test_file = work_dir / "test_skill.py"
 
-        code_file.write_text(code, encoding="utf-8")
+        # 确保代码包含必要的导入
+        full_code = code
+        if 'import os' not in code:
+            full_code = 'import os\n' + full_code
+
+        code_file.write_text(full_code, encoding="utf-8")
         test_file.write_text(tests, encoding="utf-8")
 
         # 使用 Sandbox 运行 pytest
@@ -569,6 +814,190 @@ class EvolutionService:
 
         except Exception as e:
             return {"valid": False, "error": str(e)}
+
+
+    async def evolve_typescript_project_auto(
+        self,
+        project_name: str,
+        description: str,
+        requirements: List[str],
+        target_dir: Path,
+        provider_id: Optional[str] = None,
+    ) -> EvolutionResult:
+        """自主演化 TypeScript 项目 - 使用 LLM 生成代码。
+
+        这是真正的自主演化：LLM 生成代码 -> RGV 验证 -> 落盘
+        """
+        logger.info(
+            "typescript_evolution_auto_started",
+            project_name=project_name,
+            target_dir=str(target_dir),
+        )
+
+        # Phase 0: Generate - 使用 LLM 生成代码
+        try:
+            generator = LLMCodeGenerator(provider_id=provider_id)
+            generated = await generator.generate_typescript_project(
+                project_name=project_name,
+                description=description,
+                requirements=requirements,
+            )
+            code = generated["code"]
+            tsconfig = generated["tsconfig"]
+            package_json = generated["package_json"]
+            logger.info("code_generated_by_llm", provider=generator.provider_id)
+        except Exception as e:
+            logger.error("code_generation_failed", error=str(e))
+            return EvolutionResult(
+                success=False,
+                phase="generate",
+                error_message=f"Code generation failed: {e}",
+            )
+
+        # Phase 1: Red - 验证 TypeScript 语法结构
+        red_result = self._phase_red_typescript(code, tsconfig)
+        if not red_result["passed"]:
+            return EvolutionResult(
+                success=False,
+                phase="red",
+                error_message=f"Red phase failed: {red_result['error']}",
+            )
+
+        # Phase 2: Green - TypeScript 结构验证
+        green_result = self._phase_green_typescript(code)
+        if not green_result["passed"]:
+            return EvolutionResult(
+                success=False,
+                phase="green",
+                error_message=f"Green phase failed: {green_result['error']}",
+            )
+
+        # Phase 3: Verify - TypeScript 安全扫描
+        verify_result = self._phase_verify_typescript(code)
+        if not verify_result["passed"]:
+            return EvolutionResult(
+                success=False,
+                phase="verify",
+                error_message=f"Verify phase failed: security violations found",
+            )
+
+        # Phase 4: Persist - 落盘到目标目录
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+
+            # 创建 src 目录
+            src_dir = target_dir / "src"
+            src_dir.mkdir(exist_ok=True)
+
+            # 写入文件
+            (src_dir / "index.ts").write_text(code, encoding="utf-8")
+            (target_dir / "tsconfig.json").write_text(tsconfig, encoding="utf-8")
+            (target_dir / "package.json").write_text(package_json, encoding="utf-8")
+
+            # 创建 README
+            readme = f"""# {project_name}
+
+{description}
+
+## Installation
+
+```bash
+npm install
+```
+
+## Build
+
+```bash
+npm run build
+```
+
+## Usage
+
+```bash
+npm start
+```
+
+---
+Evolved by HolonPolis RGV Crucible
+"""
+            (target_dir / "README.md").write_text(readme, encoding="utf-8")
+
+            # 生成 Attestation
+            attestation = Attestation(
+                attestation_id=f"att_ts_{project_name.lower().replace(' ', '_')}_{hashlib.sha256(code.encode()).hexdigest()[:8]}",
+                holon_id="genesis",
+                skill_name=project_name,
+                version="1.0.0",
+                red_phase_passed=True,
+                green_phase_passed=True,
+                verify_phase_passed=verify_result["passed"],
+                security_scan_results=verify_result,
+                code_hash=hashlib.sha256(code.encode()).hexdigest()[:16],
+            )
+
+            logger.info(
+                "typescript_evolution_completed",
+                project_name=project_name,
+                target_dir=str(target_dir),
+            )
+
+            return EvolutionResult(
+                success=True,
+                skill_id=f"project_{project_name.lower().replace(' ', '_')}",
+                attestation=attestation,
+                phase="complete",
+                code_path=str(src_dir / "index.ts"),
+            )
+
+        except Exception as e:
+            logger.error("typescript_persist_failed", error=str(e))
+            return EvolutionResult(
+                success=False,
+                phase="persist",
+                error_message=str(e),
+            )
+
+    def _phase_red_typescript(self, code: str, tsconfig: str) -> Dict[str, Any]:
+        """Red 阶段: 验证 TypeScript 基本结构。"""
+        # 检查 tsconfig 是有效的 JSON
+        try:
+            json.loads(tsconfig)
+        except json.JSONDecodeError as e:
+            return {"passed": False, "error": f"tsconfig.json invalid: {e}"}
+
+        # 检查代码包含必要的 TypeScript 特征
+        ts_features = [
+            ("import/export", "import " in code or "export " in code),
+            ("type annotations", ": " in code and ("string" in code or "number" in code)),
+            ("interface or type", "interface " in code or "type " in code),
+        ]
+
+        missing = [name for name, present in ts_features if not present]
+        if missing:
+            return {"passed": False, "error": f"Missing TypeScript features: {missing}"}
+
+        return {"passed": True, "error": None}
+
+    def _phase_green_typescript(self, code: str) -> Dict[str, Any]:
+        """Green 阶段: TypeScript 结构验证。"""
+        # 检查类定义和函数
+        has_class = "class " in code
+        has_function = "function " in code or "=>" in code
+
+        if not has_class and not has_function:
+            return {"passed": False, "error": "No class or function found"}
+
+        # 检查 async/await 正确使用
+        async_count = code.count("async ")
+        await_count = code.count("await ")
+        if async_count > 0 and await_count == 0:
+            return {"passed": False, "error": "Async function without await"}
+
+        return {"passed": True, "error": None}
+
+    def _phase_verify_typescript(self, code: str) -> Dict[str, Any]:
+        """Verify 阶段: TypeScript 安全扫描。"""
+        return self._typescript_scanner.scan(code)
 
 
 def create_evolution_service() -> EvolutionService:

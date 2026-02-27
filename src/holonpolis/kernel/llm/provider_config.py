@@ -152,7 +152,7 @@ def _normalize_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(provider_cfg, dict):
             continue
         cfg = dict(provider_cfg)
-        provider_type = str(cfg.get("type") or "").strip()
+        provider_type = str(cfg.get("type") or cfg.get("provider_type") or "").strip()
         if not provider_type:
             continue
         cfg["type"] = provider_type
@@ -203,6 +203,7 @@ class ProviderConfig:
     retries: int = 3
     temperature: float = 0.7
     max_tokens: int = 8192
+    model: str = ""  # Default model for this provider
     extra_headers: Dict[str, str] = field(default_factory=dict)
     model_specific: Dict[str, Any] = field(default_factory=dict)
 
@@ -219,6 +220,7 @@ class ProviderConfig:
             "retries": self.retries,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
+            "model": self.model,
             "extra_headers": self.extra_headers,
             "model_specific": self.model_specific,
         }
@@ -243,6 +245,7 @@ class ProviderConfig:
             retries=data.get("retries", 3),
             temperature=data.get("temperature", 0.7),
             max_tokens=data.get("max_tokens", 8192),
+            model=data.get("model", ""),
             extra_headers=data.get("extra_headers", {}),
             model_specific=data.get("model_specific", {}),
         )

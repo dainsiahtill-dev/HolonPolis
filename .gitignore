@@ -47,3 +47,4 @@ htmlcov/
 
 # LanceDB
 *.lance
+.harborpilot/
