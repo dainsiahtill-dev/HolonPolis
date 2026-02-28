@@ -9,12 +9,14 @@
 import os
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 import pyarrow as pa
 
 from holonpolis.kernel.embeddings.default_embedder import set_embedder, SimpleEmbedder
 from holonpolis.kernel.lancedb import (
+    LanceDBConnection,
     LanceDBFactory,
     build_memories_schema,
     EPISODES_SCHEMA,
@@ -107,6 +109,80 @@ class TestLanceDBTableOperations:
 
         assert conn.table_exists("memories") is True
         assert conn.table_exists("nonexistent") is False
+
+
+class _FakeIndexConfig:
+    def __init__(self, columns):
+        self.index_type = "FTS"
+        self.columns = columns
+
+
+class _FakeTable:
+    def __init__(self, *, raise_on_list: bool = False, existing_columns: list[str] | None = None):
+        self.raise_on_list = raise_on_list
+        self.calls: list[Any] = []
+        self._indices = [_FakeIndexConfig([col]) for col in (existing_columns or [])]
+
+    def list_indices(self):
+        return self._indices
+
+    def create_fts_index(self, field_names):
+        self.calls.append(field_names)
+        if isinstance(field_names, list) and self.raise_on_list:
+            raise ValueError("field_names must be a string when use_tantivy=False")
+
+        cols = field_names if isinstance(field_names, list) else [field_names]
+        for col in cols:
+            self._indices.append(_FakeIndexConfig([str(col)]))
+
+
+class _FakeConnection:
+    def __init__(self, table: _FakeTable):
+        self._table = table
+
+    def create_table(self, name, schema, exist_ok=True):  # noqa: ARG002
+        return self._table
+
+
+class TestLanceDBFTSCompatibility:
+    def test_single_column_list_is_coerced_to_string(self):
+        table = _FakeTable(raise_on_list=True)
+        conn = LanceDBConnection(Path("."), _FakeConnection(table))
+
+        conn.create_table(
+            "memories",
+            schema=object(),
+            enable_fts=True,
+            fts_columns=["content"],
+        )
+
+        assert table.calls == ["content"]
+
+    def test_multi_columns_falls_back_to_per_column_creation(self):
+        table = _FakeTable(raise_on_list=True)
+        conn = LanceDBConnection(Path("."), _FakeConnection(table))
+
+        conn.create_table(
+            "memories",
+            schema=object(),
+            enable_fts=True,
+            fts_columns=["content", "summary"],
+        )
+
+        assert table.calls == [["content", "summary"], "content", "summary"]
+
+    def test_existing_fts_column_is_not_recreated(self):
+        table = _FakeTable(raise_on_list=True, existing_columns=["content"])
+        conn = LanceDBConnection(Path("."), _FakeConnection(table))
+
+        conn.create_table(
+            "memories",
+            schema=object(),
+            enable_fts=True,
+            fts_columns=["content"],
+        )
+
+        assert table.calls == []
 
 
 class TestMemoryRecordOperations:

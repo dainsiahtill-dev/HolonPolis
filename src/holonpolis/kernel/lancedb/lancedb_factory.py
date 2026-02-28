@@ -6,7 +6,7 @@ Genesis has its own separate LanceDB directory.
 
 import threading
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
 import lancedb
 import structlog
@@ -49,7 +49,7 @@ class LanceDBConnection:
         schema,
         exist_ok: bool = True,
         enable_fts: bool = False,
-        fts_columns: Optional[list] = None,
+        fts_columns: Optional[Iterable[str]] = None,
     ):
         """Create a table with the given schema.
 
@@ -67,17 +67,18 @@ class LanceDBConnection:
             # 创建 FTS 索引
             if enable_fts and fts_columns:
                 try:
-                    # 检查是否已有 FTS 索引
-                    existing_indices = table.list_indices() if hasattr(table, "list_indices") else []
-                    has_fts = any(
-                        hasattr(idx, "index_type") and idx.index_type == "FTS"
-                        for idx in existing_indices
-                    )
-
-                    if not has_fts:
-                        # LanceDB FTS API: 使用字段名列表
-                        table.create_fts_index(fts_columns)
-                        logger.debug("fts_index_created", table=name, columns=fts_columns)
+                    requested_columns = self._normalize_fts_columns(fts_columns)
+                    existing_columns = self._existing_fts_columns(table)
+                    pending_columns = [
+                        column for column in requested_columns if column not in existing_columns
+                    ]
+                    if pending_columns:
+                        self._create_fts_indices(table, pending_columns)
+                        logger.debug(
+                            "fts_index_created",
+                            table=name,
+                            columns=pending_columns,
+                        )
                 except Exception as e:
                     # FTS 索引创建失败不阻塞表创建
                     logger.warning("fts_index_creation_failed", table=name, error=str(e))
@@ -88,6 +89,61 @@ class LanceDBConnection:
             if "already exists" in str(e).lower() and exist_ok:
                 return self.get_table(name)
             raise
+
+    @staticmethod
+    def _normalize_fts_columns(fts_columns: Iterable[str]) -> list[str]:
+        """Normalize FTS columns to a cleaned list of non-empty strings."""
+        if isinstance(fts_columns, str):
+            columns = [fts_columns]
+        else:
+            columns = list(fts_columns)
+
+        normalized: list[str] = []
+        for column in columns:
+            text = str(column).strip()
+            if text:
+                normalized.append(text)
+
+        if not normalized:
+            raise ValueError("fts_columns must include at least one non-empty column")
+        return normalized
+
+    @staticmethod
+    def _existing_fts_columns(table: Any) -> set[str]:
+        """Extract existing FTS-indexed columns from LanceDB index metadata."""
+        if not hasattr(table, "list_indices"):
+            return set()
+
+        existing_columns: set[str] = set()
+        for idx in table.list_indices():
+            if getattr(idx, "index_type", None) != "FTS":
+                continue
+            columns = getattr(idx, "columns", None)
+            if isinstance(columns, str):
+                existing_columns.add(columns)
+            elif isinstance(columns, list):
+                for column in columns:
+                    text = str(column).strip()
+                    if text:
+                        existing_columns.add(text)
+        return existing_columns
+
+    @staticmethod
+    def _create_fts_indices(table: Any, columns: list[str]) -> None:
+        """Create FTS index with compatibility fallback across LanceDB versions."""
+        if len(columns) == 1:
+            table.create_fts_index(columns[0])
+            return
+
+        try:
+            table.create_fts_index(columns)
+        except Exception as exc:
+            error_text = str(exc)
+            if "field_names must be a string when use_tantivy=False" not in error_text:
+                raise
+            # Some LanceDB versions require str field_names unless Tantivy is enabled.
+            for column in columns:
+                table.create_fts_index(column)
 
     def table_exists(self, name: str) -> bool:
         """Check if a table exists."""
