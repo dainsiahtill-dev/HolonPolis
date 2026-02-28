@@ -1,5 +1,7 @@
 """Runtime capability tests for evolved skills and social graph wrappers."""
 
+import asyncio
+
 import pytest
 
 from holonpolis.domain import Blueprint, Boundary, EvolutionPolicy
@@ -14,8 +16,8 @@ from holonpolis.runtime.holon_runtime import (
     SkillPayloadValidationError,
 )
 from holonpolis.services.collaboration_service import CollaborationService
-from holonpolis.services.evolution_service import EvolutionService
-from holonpolis.services.holon_service import HolonService
+from holonpolis.services.evolution_service import EvolutionResult, EvolutionService
+from holonpolis.services.holon_service import HolonService, HolonUnavailableError
 from holonpolis.services.market_service import MarketService
 
 
@@ -234,3 +236,157 @@ def execute(a, b):
     assert status.result is not None
     assert status.result["skill_id"] == "resilientadder"
     assert await runtime.execute_skill("resilientadder", a=9, b=4) == 13
+
+
+@pytest.mark.asyncio
+async def test_runtime_blocks_skill_execution_while_evolution_is_pending(runtime_setup, monkeypatch):
+    """A Holon should not execute skills while it has an in-flight self-evolution."""
+    holon_id = "runtime_pending_block"
+    blueprint = _blueprint(holon_id)
+    await HolonService().create_holon(blueprint)
+
+    service = EvolutionService()
+    schema = ToolSchema(
+        name="execute",
+        description="Add two numbers",
+        parameters={
+            "type": "object",
+            "properties": {"a": {"type": "number"}, "b": {"type": "number"}},
+        },
+        required=["a", "b"],
+    )
+    await service._phase_persist(
+        holon_id=holon_id,
+        skill_name="Adder Skill",
+        code="""
+def execute(a, b):
+    return a + b
+""",
+        tests="""
+from skill_module import execute
+
+def test_execute():
+    assert execute(2, 3) == 5
+""",
+        description="Simple adder",
+        tool_schema=schema,
+        version="0.1.0",
+        green_result={"passed": True, "details": {"exit_code": 0}},
+        verify_result={"passed": True, "violations": []},
+    )
+
+    runtime = HolonRuntime(holon_id=holon_id, blueprint=blueprint)
+    gate = asyncio.Event()
+
+    async def fake_execute_evolution(self, request):
+        request.status = EvolutionStatus.EVOLVING
+        await gate.wait()
+        request.status = EvolutionStatus.FAILED
+        request.error_message = "cancelled_for_test"
+
+    monkeypatch.setattr(HolonRuntime, "_execute_evolution", fake_execute_evolution)
+
+    request = await runtime.request_evolution(
+        skill_name="BlockedDuringUpgrade",
+        description="Should keep runtime pending",
+        requirements=["Any requirement"],
+    )
+
+    with pytest.raises(HolonUnavailableError):
+        await runtime.execute_skill("adder_skill", a=2, b=3)
+
+    gate.set()
+    status = await runtime.wait_for_evolution(
+        request_id=request.request_id,
+        timeout_seconds=5,
+        poll_interval_seconds=0.05,
+    )
+    assert status.status == EvolutionStatus.FAILED
+    assert await runtime.execute_skill("adder_skill", a=2, b=3) == 5
+
+
+@pytest.mark.asyncio
+async def test_failed_evolution_produces_next_round_plan(runtime_setup, monkeypatch):
+    """Failed evolution should leave behind a concrete self-improvement plan."""
+    holon_id = "runtime_failure_plan"
+    blueprint = _blueprint(holon_id)
+    await HolonService().create_holon(blueprint)
+    runtime = HolonRuntime(holon_id=holon_id, blueprint=blueprint)
+
+    async def fake_evolve_skill_autonomous(self, **kwargs):
+        return EvolutionResult(
+            success=False,
+            phase="green",
+            error_message="pytest failed because execute raised ValueError on empty input",
+        )
+
+    async def fake_record_evolution(self, *args, **kwargs):
+        return None
+
+    monkeypatch.setattr(EvolutionService, "evolve_skill_autonomous", fake_evolve_skill_autonomous)
+    monkeypatch.setattr(GenesisMemory, "record_evolution", fake_record_evolution)
+
+    request = await runtime.request_evolution(
+        skill_name="PlannerSkill",
+        description="Should fail and produce a retry plan",
+        requirements=["Return a deterministic execute payload"],
+    )
+    status = await runtime.wait_for_evolution(
+        request_id=request.request_id,
+        timeout_seconds=5,
+        poll_interval_seconds=0.05,
+    )
+
+    assert status.status == EvolutionStatus.FAILED
+    assert isinstance(status.result, dict)
+    assert status.result["retry_recommended"] is True
+    assert status.result["next_round_plan"]["focus"] == "stabilize_execution"
+    assert "revised_requirements" in status.result["next_round_plan"]
+
+
+@pytest.mark.asyncio
+async def test_market_selection_skips_pending_holons(runtime_setup):
+    """Selection should not evaluate pending Holons as survivors or eliminations."""
+    active_id = "market_active_holon"
+    pending_id = "market_pending_holon"
+    service = HolonService()
+
+    for holon_id in (active_id, pending_id):
+        blueprint = _blueprint(holon_id)
+        await service.create_holon(blueprint)
+
+    service.mark_pending(pending_id, reason="upgrading")
+
+    market = MarketService()
+    result = market.run_selection(threshold=0.0)
+
+    skipped_ids = {item["holon_id"] for item in result["skipped_list"]}
+    assert pending_id in skipped_ids
+    assert all(item["holon_id"] != pending_id for item in result["top_performers"])
+    assert all(item["holon_id"] != pending_id for item in result["eliminated_list"])
+
+
+@pytest.mark.asyncio
+async def test_collaboration_skips_pending_participants(runtime_setup):
+    """Pending Holons should not be enrolled as collaboration workers."""
+    service = HolonService()
+    coordinator_id = "collab_coordinator"
+    active_worker_id = "collab_worker_active"
+    pending_worker_id = "collab_worker_pending"
+
+    for holon_id in (coordinator_id, active_worker_id, pending_worker_id):
+        await service.create_holon(_blueprint(holon_id))
+
+    service.mark_pending(pending_worker_id, reason="upgrading")
+
+    collaboration = CollaborationService()
+    task = await collaboration.create_collaboration(
+        name="Pending Filter",
+        description="Ensure pending workers are skipped",
+        coordinator_id=coordinator_id,
+        participant_ids=[active_worker_id, pending_worker_id],
+        task_structure={"subtasks": [{"name": "A", "description": "Do A"}]},
+    )
+
+    assert active_worker_id in task.participants
+    assert pending_worker_id not in task.participants

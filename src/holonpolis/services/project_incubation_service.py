@@ -208,11 +208,11 @@ class ProjectIncubationService:
             requirements.append(
                 "Large multiplayer project floor: generate at least 18 files across modular directories "
                 "(for example apps/server, apps/client, shared or packages/shared, configs, docs). "
-                "Must include world simulation, matchmaking, and anti-cheat modules in source code paths."
+                "Must include modular runtime, synchronization, and security-related source modules."
             )
             requirements.append(
-                "Fish-eat-fish gameplay floor: generated code must include fish entities, movement updates, "
-                "collision detection, devour/eat mechanics, and growth progression (mass/size/score)."
+                "Gameplay floor: implementation must follow project_goal-defined rules with concrete "
+                "interaction logic and progression/state update logic."
             )
             requirements.append(
                 "Reject placeholder content in generated files (for example: TODO, TBD, placeholder, "

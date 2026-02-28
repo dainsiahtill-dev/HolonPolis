@@ -9,6 +9,21 @@ import structlog
 
 
 _LOG_CONFIGURED = False
+_NOISY_LOGGER_LEVELS: dict[str, int] = {
+    # OpenAI-compatible SDKs commonly emit one access log line per request at INFO.
+    "httpx": logging.WARNING,
+    "httpcore": logging.WARNING,
+    "openai": logging.WARNING,
+    "openai._base_client": logging.WARNING,
+}
+
+
+def _configure_third_party_loggers() -> None:
+    """Reduce third-party transport noise while preserving warnings/errors."""
+    for logger_name, level in _NOISY_LOGGER_LEVELS.items():
+        logger = logging.getLogger(logger_name)
+        logger.setLevel(level)
+        logger.propagate = True
 
 
 def configure_logging(level: str = "INFO", json_logs: bool = False) -> None:
@@ -24,6 +39,7 @@ def configure_logging(level: str = "INFO", json_logs: bool = False) -> None:
         level=log_level,
         format="%(message)s",
     )
+    _configure_third_party_loggers()
 
     processors: list[Any] = [
         structlog.contextvars.merge_contextvars,
@@ -43,4 +59,3 @@ def configure_logging(level: str = "INFO", json_logs: bool = False) -> None:
     )
 
     _LOG_CONFIGURED = True
-

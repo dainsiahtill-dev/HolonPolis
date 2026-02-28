@@ -20,6 +20,24 @@ from holonpolis.kernel.lancedb.lancedb_factory import get_lancedb_factory
 logger = structlog.get_logger()
 
 
+_STATUS_ACTIVE = "active"
+_STATUS_PENDING = "pending"
+_STATUS_FROZEN = "frozen"
+_VALID_STATUSES = frozenset({_STATUS_ACTIVE, _STATUS_PENDING, _STATUS_FROZEN})
+
+
+class HolonUnavailableError(RuntimeError):
+    """Raised when a Holon cannot accept runtime work in its current state."""
+
+    def __init__(self, holon_id: str, status: str, action: str):
+        self.holon_id = str(holon_id)
+        self.status = str(status or _STATUS_ACTIVE)
+        self.action = str(action or "run")
+        super().__init__(
+            f"Holon '{self.holon_id}' is {self.status} and cannot {self.action} until it returns to active."
+        )
+
+
 class HolonService:
     """Service for managing Holon lifecycle.
 
@@ -42,6 +60,122 @@ class HolonService:
     def _get_blueprint_path(self, holon_id: str) -> Path:
         """Get the blueprint.json path for a Holon."""
         return self._get_holon_path(holon_id) / "blueprint.json"
+
+    def _get_state_path(self, holon_id: str) -> Path:
+        """Get the state.json path for a Holon."""
+        return self._get_holon_path(holon_id) / "state.json"
+
+    def _read_state(self, holon_id: str) -> Dict[str, Any]:
+        """Read state.json, defaulting to active if missing/corrupt."""
+        state_path = self._get_state_path(holon_id)
+        if not state_path.exists():
+            return {"status": _STATUS_ACTIVE}
+        try:
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {"status": _STATUS_ACTIVE}
+        if not isinstance(payload, dict):
+            return {"status": _STATUS_ACTIVE}
+        status = str(payload.get("status") or _STATUS_ACTIVE).strip().lower()
+        if status not in _VALID_STATUSES:
+            status = _STATUS_ACTIVE
+        payload["status"] = status
+        return payload
+
+    def _write_state(self, holon_id: str, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Persist a sanitized state payload."""
+        payload = dict(state or {})
+        status = str(payload.get("status") or _STATUS_ACTIVE).strip().lower()
+        if status not in _VALID_STATUSES:
+            raise ValueError(f"Invalid Holon status: {status!r}")
+        payload["status"] = status
+        payload["updated_at"] = utc_now_iso()
+        state_path = self._get_state_path(holon_id)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return payload
+
+    def get_holon_status(self, holon_id: str) -> str:
+        """Return the Holon's runtime status."""
+        return str(self._read_state(holon_id).get("status") or _STATUS_ACTIVE)
+
+    def get_holon_state(self, holon_id: str) -> Dict[str, Any]:
+        """Return the persisted Holon state payload."""
+        return dict(self._read_state(holon_id))
+
+    def set_holon_status(
+        self,
+        holon_id: str,
+        status: str,
+        *,
+        reason: str = "",
+        details: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Persist a Holon runtime status transition."""
+        normalized = str(status or _STATUS_ACTIVE).strip().lower()
+        existing = self._read_state(holon_id)
+        payload: Dict[str, Any] = {
+            "status": normalized,
+        }
+        if reason:
+            payload["reason"] = str(reason)
+        elif "reason" in existing:
+            payload["reason"] = existing["reason"]
+        if isinstance(details, dict) and details:
+            payload["details"] = dict(details)
+        elif "details" in existing:
+            payload["details"] = existing["details"]
+
+        if normalized == _STATUS_PENDING:
+            payload["pending_at"] = utc_now_iso()
+            payload.pop("resumed_at", None)
+            payload.pop("frozen_at", None)
+        elif normalized == _STATUS_FROZEN:
+            payload["frozen_at"] = utc_now_iso()
+            payload.pop("pending_at", None)
+            payload.pop("resumed_at", None)
+        else:
+            payload["resumed_at"] = utc_now_iso()
+            payload.pop("pending_at", None)
+            payload.pop("frozen_at", None)
+
+        saved = self._write_state(holon_id, payload)
+        logger.info("holon_status_changed", holon_id=holon_id, status=normalized, reason=reason or None)
+        return saved
+
+    def mark_pending(
+        self,
+        holon_id: str,
+        *,
+        reason: str = "evolving",
+        details: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Mark a Holon as pending while it upgrades."""
+        return self.set_holon_status(holon_id, _STATUS_PENDING, reason=reason, details=details)
+
+    def mark_active(
+        self,
+        holon_id: str,
+        *,
+        reason: str = "ready",
+        details: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Mark a Holon as active/runnable."""
+        return self.set_holon_status(holon_id, _STATUS_ACTIVE, reason=reason, details=details)
+
+    def is_pending(self, holon_id: str) -> bool:
+        """Check if a Holon is pending."""
+        return self.get_holon_status(holon_id) == _STATUS_PENDING
+
+    def is_active(self, holon_id: str) -> bool:
+        """Check if a Holon is active/runnable."""
+        return self.get_holon_status(holon_id) == _STATUS_ACTIVE
+
+    def assert_runnable(self, holon_id: str, *, action: str = "run") -> None:
+        """Raise if the Holon is not active and therefore not runnable."""
+        status = self.get_holon_status(holon_id)
+        if status != _STATUS_ACTIVE:
+            raise HolonUnavailableError(holon_id=holon_id, status=status, action=action)
 
     async def create_holon(
         self,
@@ -72,6 +206,9 @@ class HolonService:
             json.dumps(blueprint.to_dict(), indent=2),
             encoding="utf-8"
         )
+        state_path = holon_path / "state.json"
+        if not state_path.exists():
+            self.mark_active(holon_id, reason="created")
 
         # Initialize LanceDB for this Holon
         self.factory.init_holon_tables(holon_id)
@@ -141,6 +278,7 @@ class HolonService:
                             "species_id": data["species_id"],
                             "purpose": data["purpose"],
                             "created_at": data.get("created_at"),
+                            "status": self.get_holon_status(data["holon_id"]),
                         })
                     except Exception as e:
                         logger.warning("failed_to_load_blueprint", path=str(blueprint_path), error=str(e))
@@ -152,45 +290,17 @@ class HolonService:
 
         This prevents new episodes but preserves memory for potential resume.
         """
-        holon_path = self._get_holon_path(holon_id)
-        state_path = holon_path / "state.json"
-
-        state = {
-            "status": "frozen",
-            "frozen_at": utc_now_iso(),
-        }
-
-        state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
-
+        self.set_holon_status(holon_id, _STATUS_FROZEN, reason="manual_freeze")
         logger.info("holon_frozen", holon_id=holon_id)
 
     def resume_holon(self, holon_id: str) -> None:
         """Resume a frozen Holon."""
-        holon_path = self._get_holon_path(holon_id)
-        state_path = holon_path / "state.json"
-
-        if state_path.exists():
-            state = {
-                "status": "active",
-                "resumed_at": utc_now_iso(),
-            }
-            state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
-
+        self.mark_active(holon_id, reason="manual_resume")
         logger.info("holon_resumed", holon_id=holon_id)
 
     def is_frozen(self, holon_id: str) -> bool:
         """Check if a Holon is frozen."""
-        holon_path = self._get_holon_path(holon_id)
-        state_path = holon_path / "state.json"
-
-        if not state_path.exists():
-            return False
-
-        try:
-            state = json.loads(state_path.read_text(encoding="utf-8"))
-            return state.get("status") == "frozen"
-        except Exception:
-            return False
+        return self.get_holon_status(holon_id) == _STATUS_FROZEN
 
     def delete_holon(self, holon_id: str) -> None:
         """Permanently delete a Holon and all its data.

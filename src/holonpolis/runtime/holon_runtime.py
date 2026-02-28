@@ -41,7 +41,7 @@ from holonpolis.kernel.tools import (
     ToolChainResult,
     execute_tool,
 )
-from holonpolis.services.holon_service import HolonService
+from holonpolis.services.holon_service import HolonService, HolonUnavailableError
 from holonpolis.services.memory_service import MemoryService
 
 logger = structlog.get_logger()
@@ -129,6 +129,7 @@ class HolonRuntime:
 
     def __init__(self, holon_id: str, blueprint: Optional[Blueprint] = None, workspace: Optional[str] = None):
         self.holon_id = holon_id
+        self._holon_service = HolonService()
         self.blueprint = blueprint or self._load_blueprint()
         self.memory = MemoryService(holon_id)
         self.llm = get_llm_runtime()
@@ -145,8 +146,22 @@ class HolonRuntime:
 
     def _load_blueprint(self) -> Blueprint:
         """Load blueprint from disk."""
-        svc = HolonService()
-        return svc.get_blueprint(self.holon_id)
+        return self._holon_service.get_blueprint(self.holon_id)
+
+    def _has_inflight_evolution(self) -> bool:
+        """Return True when any local evolution request is still non-terminal."""
+        terminal = {
+            EvolutionStatus.COMPLETED,
+            EvolutionStatus.FAILED,
+            EvolutionStatus.REJECTED,
+        }
+        return any(request.status not in terminal for request in self._evolution_requests.values())
+
+    def _assert_runtime_available(self, *, action: str) -> None:
+        """Block runtime work while the Holon is pending or frozen."""
+        if self._has_inflight_evolution():
+            raise HolonUnavailableError(holon_id=self.holon_id, status="pending", action=action)
+        self._holon_service.assert_runnable(self.holon_id, action=action)
 
     def _build_system_prompt(self) -> str:
         """Build the system prompt from blueprint."""
@@ -185,6 +200,7 @@ class HolonRuntime:
         Returns:
             Response dict with content and metadata
         """
+        self._assert_runtime_available(action="chat")
         start_time = time.time()
 
         # 1. Recall relevant memories
@@ -371,6 +387,7 @@ class HolonRuntime:
         Returns:
             EvolutionRequest with status and result
         """
+        self._assert_runtime_available(action="evolve")
         request_id = f"evo_{uuid.uuid4().hex[:12]}"
 
         logger.info(
@@ -396,11 +413,27 @@ class HolonRuntime:
         # Store request
         self.state.evolution_requests.append(request_id)
         self._evolution_requests[request_id] = request
-        await self.remember(
-            content=f"Evolution request {request_id}: {skill_name} - {description}",
-            tags=["evolution", "skill_request"],
-            importance=0.9,
+        self._holon_service.mark_pending(
+            self.holon_id,
+            reason="evolution_requested",
+            details={"service": "holon_runtime", "request_id": request_id},
         )
+        try:
+            await self.remember(
+                content=f"Evolution request {request_id}: {skill_name} - {description}",
+                tags=["evolution", "skill_request"],
+                importance=0.9,
+            )
+        except Exception:
+            self.state.evolution_requests.remove(request_id)
+            self._evolution_requests.pop(request_id, None)
+            if self._holon_service.get_holon_status(self.holon_id) == "pending":
+                self._holon_service.mark_active(
+                    self.holon_id,
+                    reason="evolution_request_aborted",
+                    details={"service": "holon_runtime", "request_id": request_id},
+                )
+            raise
 
         # Execute evolution asynchronously
         asyncio.create_task(self._execute_evolution(request))
@@ -443,6 +476,7 @@ class HolonRuntime:
                     requirements=request.requirements,
                     test_cases=request.test_cases,
                     tool_schema=tool_schema,
+                    pending_token=request.request_id,
                 )
             else:
                 # Autonomous mode: LLM generates tests + code inside EvolutionService.
@@ -452,6 +486,7 @@ class HolonRuntime:
                     description=request.description,
                     requirements=request.requirements,
                     tool_schema=tool_schema,
+                    pending_token=request.request_id,
                 )
 
         except Exception as e:
@@ -463,6 +498,12 @@ class HolonRuntime:
                 error=str(e),
             )
             request.completed_at = utc_now_iso()
+            if self._holon_service.get_holon_status(self.holon_id) == "pending":
+                self._holon_service.mark_active(
+                    self.holon_id,
+                    reason="evolution_failed_early",
+                    details={"service": "holon_runtime", "request_id": request.request_id},
+                )
             return
 
         if result and result.success:
@@ -566,6 +607,93 @@ class HolonRuntime:
                 error=str(exc),
             )
 
+    @staticmethod
+    def _summarize_failure_message(message: Any, limit: int = 220) -> str:
+        """Compact noisy failure text for telemetry and next-step planning."""
+        text = re.sub(r"\s+", " ", str(message or "").strip())
+        if len(text) <= limit:
+            return text
+        return text[:limit].rstrip() + "..."
+
+    def _build_failure_improvement_plan(
+        self,
+        request: EvolutionRequest,
+        result: Any,
+    ) -> Dict[str, Any]:
+        """Turn an evolution failure into a concrete next-round improvement plan."""
+        phase = str(getattr(result, "phase", "") or "unknown").strip().lower()
+        failure_summary = self._summarize_failure_message(
+            getattr(result, "error_message", "") or request.error_message or "evolution_failed"
+        )
+
+        focus_map: Dict[str, Dict[str, Any]] = {
+            "red": {
+                "focus": "tighten_contract",
+                "actions": [
+                    "Narrow the interface to one deterministic entrypoint with explicit parameters.",
+                    "Regenerate tests so they validate the contract without hidden assumptions.",
+                    "Prefer simpler test fixtures and fewer branches in the first repair round.",
+                ],
+            },
+            "green": {
+                "focus": "stabilize_execution",
+                "actions": [
+                    "Reduce logic complexity and keep the implementation pure and deterministic.",
+                    "Handle empty or malformed input without raising exceptions.",
+                    "Return the exact schema expected by tests before adding optimizations.",
+                ],
+            },
+            "verify": {
+                "focus": "remove_restricted_constructs",
+                "actions": [
+                    "Remove banned imports, dynamic execution, and reflective attribute access.",
+                    "Use only safe standard-language constructs that pass AST verification.",
+                    "Re-check helper utilities for hidden unsafe calls before retrying.",
+                ],
+            },
+            "persist": {
+                "focus": "stabilize_artifacts",
+                "actions": [
+                    "Keep output paths relative and within the Holon sandbox.",
+                    "Ensure manifest and attestation data are complete and serializable.",
+                    "Avoid emitting malformed metadata in the next retry.",
+                ],
+            },
+        }
+        defaults = {
+            "focus": "reduce_scope",
+            "actions": [
+                "Shrink the requirement surface and retry with the smallest useful behavior.",
+                "Preserve deterministic behavior first, then add complexity in later iterations.",
+                "Use the latest failure as a hard constraint for the next prompt.",
+            ],
+        }
+        chosen = focus_map.get(phase, defaults)
+        revised_requirements = list(request.requirements)
+        revised_requirements.append(f"Address previous {phase} failure: {failure_summary}")
+
+        retry_prompt = (
+            f"Previous evolution for skill '{request.skill_name}' failed in phase '{phase}'. "
+            f"Failure summary: {failure_summary}. "
+            f"Next-round focus: {chosen['focus']}. "
+            "Follow the listed repair actions and keep the implementation minimal, deterministic, and sandbox-safe."
+        )
+
+        return {
+            "status": "failed",
+            "request_id": request.request_id,
+            "skill_name": request.skill_name,
+            "failure_phase": phase,
+            "failure_summary": failure_summary,
+            "retry_recommended": True,
+            "next_round_plan": {
+                "focus": chosen["focus"],
+                "repair_actions": list(chosen["actions"]),
+                "revised_requirements": revised_requirements,
+                "retry_prompt": retry_prompt,
+            },
+        }
+
     async def _learn_from_evolution_failure(
         self,
         request: EvolutionRequest,
@@ -578,9 +706,15 @@ class HolonRuntime:
             phase=result.phase if hasattr(result, 'phase') else 'unknown',
         )
 
+        improvement_plan = self._build_failure_improvement_plan(request, result)
+        request.result = improvement_plan
+
         await self.remember(
-            content=f"Evolution failed for {request.skill_name}: {result.error_message}",
-            tags=["evolution", "failure", request.skill_name],
+            content=(
+                f"Evolution failed for {request.skill_name}: {improvement_plan['failure_summary']} | "
+                f"next_focus={improvement_plan['next_round_plan']['focus']}"
+            ),
+            tags=["evolution", "failure", "improvement_plan", request.skill_name],
             importance=0.8,
         )
 
@@ -784,6 +918,7 @@ class HolonRuntime:
         **kwargs: Any,
     ) -> Any:
         """Convenience wrapper to execute a persisted evolved skill."""
+        self._assert_runtime_available(action="execute")
         self.enforce_capability("skill.execute", aliases=["execute"])
         skill = self.get_skill(skill_name_or_id)
         merged_payload: Dict[str, Any] = {}

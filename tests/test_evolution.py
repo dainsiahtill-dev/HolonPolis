@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from holonpolis.domain import Blueprint, Boundary, EvolutionPolicy
 from holonpolis.domain.skills import ToolSchema
 from holonpolis.kernel.embeddings.default_embedder import set_embedder, SimpleEmbedder
 from holonpolis.kernel.lancedb import get_lancedb_factory, reset_factory
@@ -22,6 +23,7 @@ from holonpolis.services.evolution_service import (
     EvolutionService,
     SecurityScanner,
 )
+from holonpolis.services.holon_service import HolonService
 
 
 @pytest.fixture
@@ -172,6 +174,50 @@ def broken_test(
 
         assert result["passed"] is False
         assert "syntax error" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_evolution_service_marks_holon_pending_during_run(evolution_setup, monkeypatch):
+    """Holons should be pending while evolution is executing and active afterwards."""
+    holon_id = "pending_guard_holon"
+    await HolonService().create_holon(
+        Blueprint(
+            blueprint_id=f"bp_{holon_id}",
+            holon_id=holon_id,
+            species_id="generalist",
+            name="Pending Guard",
+            purpose="Verify pending during evolution",
+            boundary=Boundary(),
+            evolution_policy=EvolutionPolicy(),
+        )
+    )
+
+    observed: dict[str, str] = {}
+
+    async def fake_phase_red(self, tests):
+        observed["status_during_red"] = HolonService().get_holon_status(holon_id)
+        return {"passed": False, "error": "stop_after_status_check"}
+
+    monkeypatch.setattr(EvolutionService, "_phase_red", fake_phase_red)
+
+    service = EvolutionService()
+    result = await service.evolve_skill(
+        holon_id=holon_id,
+        skill_name="PendingSkill",
+        code="def execute():\n    return 1\n",
+        tests="def test_execute():\n    assert True\n",
+        description="status transition test",
+        tool_schema=ToolSchema(
+            name="execute",
+            description="No-op",
+            parameters={"type": "object", "properties": {}},
+        ),
+    )
+
+    assert result.success is False
+    assert result.phase == "red"
+    assert observed["status_during_red"] == "pending"
+    assert HolonService().get_holon_status(holon_id) == "active"
 
 
 class TestGreenPhase:
@@ -688,8 +734,21 @@ class TestProjectContractTests:
         assert "test_skill_source_avoids_format_template_brace_risk" in template
         assert "test_no_placeholder_tokens" in template
         assert "test_domain_modules_present_for_large_game" in template
-        assert "test_fish_gameplay_semantics_present" in template
+        assert "test_gameplay_semantics_present" in template
         assert "test_gameplay_modules_have_substantive_logic" in template
+
+    def test_project_contract_template_encodes_goal_keywords_without_preset_business_logic(self):
+        requirements = [
+            "execute(...) must return a dict with keys: project_name, project_slug, files, run_instructions.",
+            "files must be Dict[str, str] mapping relative file paths to UTF-8 text content.",
+            "Project goal: Build a large multiplayer alchemy guild simulation with faction diplomacy.",
+        ]
+        template = EvolutionService._build_project_contract_tests(requirements)
+        lowered = template.lower()
+        assert "project_goal =" in lowered
+        assert "goal_keywords =" in lowered
+        assert "alchemy" in lowered
+        assert "diplomacy" in lowered
 
     def test_project_contract_template_passes_contract_validation(self):
         requirements = [

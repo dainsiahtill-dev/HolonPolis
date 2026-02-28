@@ -83,6 +83,13 @@ class GenesisService:
                     "success_rate": 0.0,
                 })
 
+        available_holons = [
+            item
+            for item in available_holons
+            if self.holon_service.holon_exists(str(item.get("holon_id") or ""))
+            and self.holon_service.is_active(str(item.get("holon_id") or ""))
+        ]
+
         # Ask Evolution Lord for decision
         try:
             decision = await self.evolution_lord.decide(
@@ -100,6 +107,9 @@ class GenesisService:
             if not self.holon_service.holon_exists(decision.holon_id):
                 logger.error("route_to_nonexistent_holon", holon_id=decision.holon_id)
                 # Fallback to spawn
+                return await self._spawn_for_request(user_request)
+            if not self.holon_service.is_active(decision.holon_id):
+                logger.info("route_to_non_runnable_holon", holon_id=decision.holon_id)
                 return await self._spawn_for_request(user_request)
 
             # Record the route decision

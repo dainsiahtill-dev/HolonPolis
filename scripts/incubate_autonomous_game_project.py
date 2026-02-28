@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -18,6 +19,24 @@ from holonpolis.services.project_incubation_service import (  # noqa: E402
     ProjectIncubationSpec,
     ProjectIncubationService,
 )
+
+
+def _resolve_export_dir(raw: str) -> Path:
+    target = Path(raw).expanduser().resolve()
+    temp_root = Path("C:/Temp").resolve()
+    if target == temp_root:
+        raise ValueError("export_dir must be a project directory under C:/Temp, not C:/Temp itself")
+    if temp_root not in target.parents:
+        raise ValueError("export_dir must be within C:/Temp")
+    return target
+
+
+def _export_project_tree(source_dir: Path, export_dir: Path) -> Path:
+    if export_dir.exists():
+        shutil.rmtree(export_dir)
+    export_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source_dir, export_dir)
+    return export_dir
 
 
 async def _run(args: argparse.Namespace) -> int:
@@ -39,6 +58,11 @@ async def _run(args: argparse.Namespace) -> int:
 
     result = await service.incubate_project(spec)
     payload = result.to_dict()
+    if args.export_dir:
+        source_dir = Path(result.output_dir).resolve()
+        export_dir = _resolve_export_dir(args.export_dir)
+        exported = _export_project_tree(source_dir, export_dir)
+        payload["export_dir"] = str(exported)
 
     if args.output_json:
         output_path = Path(args.output_json)
@@ -103,6 +127,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--output-json",
         default=None,
         help="Optional path to persist run result JSON.",
+    )
+    parser.add_argument(
+        "--export-dir",
+        default=None,
+        help="Optional export directory under C:/Temp for final materialized project files.",
     )
     return parser
 

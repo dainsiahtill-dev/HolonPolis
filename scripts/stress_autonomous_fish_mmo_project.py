@@ -336,8 +336,53 @@ def _find_free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def _infer_gameplay_profile(project_goal: str) -> str:
+    lowered = str(project_goal or "").lower()
+    fish_keywords = ("fish", "大鱼", "小鱼", "吞噬", "devour", "fish-eat", "eat fish")
+    if any(keyword in lowered for keyword in fish_keywords):
+        return "fish"
+
+    rpg_keywords = (
+        "rpg",
+        "role-playing",
+        "role playing",
+        "角色扮演",
+        "职业",
+        "战斗",
+        "副本",
+        "任务",
+        "装备",
+        "等级",
+    )
+    if any(keyword in lowered for keyword in rpg_keywords):
+        return "rpg"
+    return "generic"
+
+
+def _gameplay_semantic_terms(profile: str) -> Dict[str, tuple[str, ...]]:
+    if profile == "fish":
+        return {
+            "entity": ("fish", "大鱼", "小鱼"),
+            "interaction": ("eat", "devour", "consume", "吞噬", "collision", "overlap", "hitbox", "碰撞"),
+            "progression": ("grow", "growth", "mass", "size", "score", "成长"),
+        }
+    if profile == "rpg":
+        return {
+            "roles": ("rpg", "role", "class", "职业", "角色"),
+            "combat": ("combat", "battle", "skill", "damage", "战斗", "技能"),
+            "progression": ("level", "experience", "xp", "成长", "升级", "attribute"),
+            "inventory": ("inventory", "equipment", "item", "loot", "装备", "背包"),
+        }
+    return {
+        "entity": ("entity", "player", "npc", "world", "state"),
+        "interaction": ("interaction", "combat", "battle", "collision", "movement"),
+        "progression": ("progress", "growth", "score", "level", "rank", "attributes", "成长"),
+    }
+
+
 def analyze_project_quality(
     project_dir: Path,
+    project_goal: str,
     min_generated_files: int,
     min_source_files: int,
     max_placeholder_hits: int,
@@ -395,15 +440,12 @@ def analyze_project_quality(
         except Exception:
             continue
     source_corpus = "\n".join(source_corpus_parts)
-    has_fish_term = any(token in source_corpus for token in ("fish", "大鱼", "小鱼"))
-    has_eat_term = any(token in source_corpus for token in ("eat", "devour", "consume", "吞噬"))
-    has_growth_term = any(
-        token in source_corpus for token in ("grow", "growth", "mass", "size", "score", "成长")
+    gameplay_profile = _infer_gameplay_profile(project_goal)
+    semantic_terms = _gameplay_semantic_terms(gameplay_profile)
+    gameplay_ok = all(
+        any(token in source_corpus for token in terms)
+        for terms in semantic_terms.values()
     )
-    has_collision_term = any(
-        token in source_corpus for token in ("collision", "overlap", "hitbox", "碰撞")
-    )
-    gameplay_ok = has_fish_term and has_eat_term and has_growth_term and has_collision_term
 
     domain_flags = {
         "server": any("apps/server/" in rel for rel in rel_paths),
@@ -461,6 +503,7 @@ def analyze_project_quality(
         "ok": len(reasons) == 0,
         "generated_files": len(all_files),
         "source_files": len(source_files),
+        "gameplay_profile": gameplay_profile,
         "domain_flags": domain_flags,
         "thin_source_files": thin_source_files[:100],
         "placeholder_hits": placeholder_hits[:100],
@@ -470,6 +513,7 @@ def analyze_project_quality(
 
 def run_runtime_probe(
     project_dir: Path,
+    project_goal: str,
     port: int,
     ws_timeout_ms: int,
     load_clients: int,
@@ -488,6 +532,7 @@ def run_runtime_probe(
 
     quality = analyze_project_quality(
         project_dir=project_dir,
+        project_goal=project_goal,
         min_generated_files=min_generated_files,
         min_source_files=min_source_files,
         max_placeholder_hits=max_placeholder_hits,
@@ -726,6 +771,7 @@ async def run(args: argparse.Namespace) -> int:
             runtime_probe = await asyncio.to_thread(
                 run_runtime_probe,
                 Path(incubation.output_dir),
+                args.project_goal,
                 port,
                 args.ws_timeout_ms,
                 args.load_clients,
@@ -821,7 +867,7 @@ async def run(args: argparse.Namespace) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Stress autonomous Holon project incubation for MMO fish game"
+        description="Stress autonomous Holon project incubation for large multiplayer game goals"
     )
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument(

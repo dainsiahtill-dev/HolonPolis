@@ -13,7 +13,7 @@ from holonpolis.runtime.holon_runtime import (
     SkillPayloadValidationError,
 )
 from holonpolis.services.genesis_service import GenesisService
-from holonpolis.services.holon_service import HolonService
+from holonpolis.services.holon_service import HolonService, HolonUnavailableError
 
 router = APIRouter(prefix="/holons", tags=["holons"])
 
@@ -324,13 +324,14 @@ async def list_holons(
 ) -> List[HolonSummary]:
     """List all Holons."""
     holons = await genesis.list_all_holons()
+    service = HolonService()
     return [
         HolonSummary(
             holon_id=h["holon_id"],
             name=h["name"],
             species_id=h["species_id"],
             purpose=h["purpose"],
-            status="active",
+            status=service.get_holon_status(h["holon_id"]),
         )
         for h in holons
     ]
@@ -347,7 +348,9 @@ async def get_holon(holon_id: str) -> HolonDetail:
             holon_id=holon_id,
             blueprint=blueprint.to_dict(),
             stats={
+                "status": service.get_holon_status(holon_id),
                 "is_frozen": service.is_frozen(holon_id),
+                "is_pending": service.is_pending(holon_id),
             },
         )
     except Exception as exc:
@@ -416,13 +419,16 @@ async def request_evolution(
     """Request a new skill evolution through RGV."""
     runtime = _get_runtime(holon_id, manager)
     _enforce_capability(runtime, "evolution.request", aliases=["evolve", "execute"])
-    evo = await runtime.request_evolution(
-        skill_name=request.skill_name,
-        description=request.description,
-        requirements=request.requirements,
-        test_cases=request.test_cases,
-        parent_skills=request.parent_skills,
-    )
+    try:
+        evo = await runtime.request_evolution(
+            skill_name=request.skill_name,
+            description=request.description,
+            requirements=request.requirements,
+            test_cases=request.test_cases,
+            parent_skills=request.parent_skills,
+        )
+    except HolonUnavailableError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     return {
         "request_id": evo.request_id,
         "holon_id": evo.holon_id,
@@ -496,6 +502,8 @@ async def execute_skill(
             skill_name_or_id=skill_name_or_id,
             payload=request.payload,
         )
+    except HolonUnavailableError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     except CapabilityDeniedError as exc:
         raise HTTPException(status_code=403, detail=str(exc))
     except FileNotFoundError as exc:

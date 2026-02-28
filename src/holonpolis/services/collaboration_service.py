@@ -28,7 +28,7 @@ from holonpolis.domain.social import (
 )
 from holonpolis.infrastructure.time_utils import utc_now_iso
 from holonpolis.runtime.holon_runtime import HolonRuntime
-from holonpolis.services.holon_service import HolonService
+from holonpolis.services.holon_service import HolonService, HolonUnavailableError
 from holonpolis.services.social_state_store import SocialStateStore
 
 logger = structlog.get_logger()
@@ -51,6 +51,13 @@ class CollaborationService:
         self.active_collaborations = _GLOBAL_ACTIVE_COLLABORATIONS
         self.social_graph = _GLOBAL_SOCIAL_GRAPH
         self.holon_service = HolonService()
+
+    def _is_holon_runnable(self, holon_id: str) -> bool:
+        """Return True when the Holon can be scheduled for collaboration."""
+        try:
+            return self.holon_service.is_active(holon_id)
+        except Exception:
+            return False
 
     @classmethod
     def reset_in_memory_cache(cls) -> None:
@@ -277,6 +284,9 @@ class CollaborationService:
         Returns:
             CollaborationTask
         """
+        if not self._is_holon_runnable(coordinator_id):
+            raise HolonUnavailableError(coordinator_id, self.holon_service.get_holon_status(coordinator_id), "coordinate")
+
         task_id = f"collab_{uuid.uuid4().hex[:12]}"
 
         # 创建协作任务
@@ -290,8 +300,18 @@ class CollaborationService:
 
         # 添加参与者
         for holon_id in participant_ids:
+            if not self._is_holon_runnable(holon_id):
+                logger.info("collaboration_skip_non_runnable_participant", task_id=task_id, holon_id=holon_id)
+                continue
             task.participants[holon_id] = {
                 "role": "worker",
+                "status": "invited",
+                "contribution": 0.0,
+            }
+
+        if coordinator_id not in task.participants:
+            task.participants[coordinator_id] = {
+                "role": "coordinator",
                 "status": "invited",
                 "contribution": 0.0,
             }
@@ -410,7 +430,7 @@ class CollaborationService:
         """分配子任务给参与者。"""
         workers = [
             hid for hid, info in task.participants.items()
-            if info["role"] == "worker"
+            if info["role"] == "worker" and self._is_holon_runnable(hid)
         ]
 
         if not workers:
@@ -510,6 +530,7 @@ Provide a comprehensive final result."""
 
     def _get_holon_runtime(self, holon_id: str) -> HolonRuntime:
         """获取 Holon runtime 实例。"""
+        self.holon_service.assert_runnable(holon_id, action="collaborate")
         blueprint = self.holon_service.get_blueprint(holon_id)
         return HolonRuntime(holon_id=holon_id, blueprint=blueprint)
 
@@ -528,6 +549,11 @@ Provide a comprehensive final result."""
             min_trust=min_reputation,
             top_k=top_k,
         )
+        candidates = [
+            (hid, score)
+            for hid, score in candidates
+            if self._is_holon_runnable(hid)
+        ]
 
         if len(candidates) < top_k:
             # 从 Genesis 查找更多 Holon
@@ -538,6 +564,8 @@ Provide a comprehensive final result."""
             for holon_data in all_holons:
                 hid = holon_data["holon_id"]
                 if hid in existing:
+                    continue
+                if str(holon_data.get("status") or "active") != "active":
                     continue
 
                 # 检查技能匹配

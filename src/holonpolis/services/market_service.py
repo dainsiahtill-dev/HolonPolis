@@ -43,6 +43,13 @@ class MarketService:
         self._state_store = SocialStateStore()
         self._ensure_state_loaded()
 
+    def _is_holon_runnable(self, holon_id: str) -> bool:
+        """Return True when the Holon can participate in market work."""
+        try:
+            return self.holon_service.is_active(holon_id)
+        except Exception:
+            return False
+
     @classmethod
     def reset_in_memory_cache(cls) -> None:
         """Reset process cache (useful for tests and root switches)."""
@@ -206,6 +213,7 @@ class MarketService:
             skill_description=skill_description,
             price_per_use=price_per_use,
             success_rate=success_rate,
+            is_active=self._is_holon_runnable(holon_id),
         )
 
         self.offers[offer_id] = offer
@@ -237,6 +245,8 @@ class MarketService:
 
         for offer in self.offers.values():
             if not offer.is_active:
+                continue
+            if not self._is_holon_runnable(offer.holon_id):
                 continue
 
             # 价格筛选
@@ -359,10 +369,25 @@ class MarketService:
             task=task_description[:50],
         )
 
+        runnable_participants = [
+            holon_id for holon_id in participant_ids
+            if self._is_holon_runnable(holon_id)
+        ]
+        skipped_participants = [
+            holon_id for holon_id in participant_ids
+            if holon_id not in runnable_participants
+        ]
+        if skipped_participants:
+            logger.info(
+                "competition_skipped_non_runnable",
+                competition_id=competition_id,
+                skipped=len(skipped_participants),
+            )
+
         # 每个参与者执行任务
         scores: Dict[str, Dict[str, float]] = {}
 
-        for holon_id in participant_ids:
+        for holon_id in runnable_participants:
             holon = self._get_holon(holon_id)
             holon_scores = await self._evaluate_holon(
                 holon, task_description, test_cases, evaluation_criteria
@@ -381,7 +406,7 @@ class MarketService:
         result = CompetitionResult(
             competition_id=competition_id,
             task_description=task_description,
-            participants=participant_ids,
+            participants=runnable_participants,
             scores=scores,
             ranking=ranking,
             winner=ranking[0] if ranking else None,
@@ -396,7 +421,7 @@ class MarketService:
         self.competition_history.append(result)
 
         # 更新声誉
-        for holon_id in participant_ids:
+        for holon_id in runnable_participants:
             reputation = self._get_reputation(holon_id)
             rank = ranking.index(holon_id) + 1 if holon_id in ranking else len(ranking)
 
@@ -478,9 +503,20 @@ class MarketService:
 
         survivors = []
         eliminated = []
+        skipped = []
 
         for holon_data in all_holons:
             holon_id = holon_data["holon_id"]
+            status = str(holon_data.get("status") or "active")
+            if status != "active":
+                skipped.append(
+                    {
+                        "holon_id": holon_id,
+                        "status": status,
+                        "reason": "not_runnable",
+                    }
+                )
+                continue
             reputation = self._get_reputation(holon_id)
 
             # 计算生存分数
@@ -527,8 +563,10 @@ class MarketService:
             "total": len(all_holons),
             "survivors": len(survivors),
             "eliminated": len(eliminated),
+            "skipped": len(skipped),
             "top_performers": survivors[:5],
             "eliminated_list": eliminated,
+            "skipped_list": skipped,
             "selection_pressure": 1.0 - threshold,
         }
 
@@ -544,7 +582,10 @@ class MarketService:
 
     def get_market_stats(self) -> Dict[str, Any]:
         """获取市场统计信息。"""
-        active_offers = [o for o in self.offers.values() if o.is_active]
+        active_offers = [
+            o for o in self.offers.values()
+            if o.is_active and self._is_holon_runnable(o.holon_id)
+        ]
 
         return {
             "total_offers": len(self.offers),
@@ -559,6 +600,7 @@ class MarketService:
     def _get_holon(self, holon_id: str):
         """获取 Holon runtime。"""
         from holonpolis.runtime.holon_runtime import HolonRuntime
+        self.holon_service.assert_runnable(holon_id, action="participate_in_market")
         blueprint = self.holon_service.get_blueprint(holon_id)
         return HolonRuntime(holon_id=holon_id, blueprint=blueprint)
 

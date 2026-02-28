@@ -20,7 +20,7 @@ import re
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import structlog
 
@@ -30,6 +30,7 @@ from holonpolis.infrastructure.time_utils import utc_now_iso
 from holonpolis.kernel.llm.llm_runtime import LLMConfig, get_llm_runtime
 from holonpolis.kernel.sandbox import SandboxConfig, SandboxRunner
 from holonpolis.kernel.storage import HolonPathGuard
+from holonpolis.services.holon_service import HolonService, HolonUnavailableError
 
 logger = structlog.get_logger()
 
@@ -326,6 +327,9 @@ class EvolutionService:
         self.security_scanner = SecurityScanner()
         self._sandbox: Optional[SandboxRunner] = None
         self._llm = get_llm_runtime()
+        self._holon_service = HolonService()
+        self._pending_depths: Dict[str, int] = {}
+        self._pending_lock = asyncio.Lock()
 
     @property
     def sandbox(self) -> SandboxRunner:
@@ -333,6 +337,70 @@ class EvolutionService:
         if self._sandbox is None:
             self._sandbox = SandboxRunner()
         return self._sandbox
+
+    async def _enter_pending(self, holon_id: str, pending_token: Optional[str] = None) -> None:
+        """Transition the Holon into pending once for the outermost evolution call."""
+        should_mark = False
+        async with self._pending_lock:
+            current = int(self._pending_depths.get(holon_id, 0))
+            if current == 0:
+                state = self._holon_service.get_holon_state(holon_id)
+                status = str(state.get("status") or "active")
+                if status == "frozen":
+                    raise HolonUnavailableError(holon_id=holon_id, status=status, action="evolve")
+                if status == "pending":
+                    details = state.get("details")
+                    request_id = None
+                    if isinstance(details, dict):
+                        request_id = str(details.get("request_id") or "").strip()
+                    if not pending_token or request_id != str(pending_token):
+                        raise HolonUnavailableError(holon_id=holon_id, status=status, action="evolve")
+                else:
+                    should_mark = True
+            self._pending_depths[holon_id] = current + 1
+
+        if should_mark:
+            details = {"service": "evolution_service"}
+            if pending_token:
+                details["request_id"] = str(pending_token)
+            self._holon_service.mark_pending(
+                holon_id,
+                reason="evolving_skill",
+                details=details,
+            )
+
+    async def _exit_pending(self, holon_id: str) -> None:
+        """Transition the Holon back to active when the outermost call completes."""
+        should_mark = False
+        async with self._pending_lock:
+            current = int(self._pending_depths.get(holon_id, 0))
+            if current <= 1:
+                self._pending_depths.pop(holon_id, None)
+                should_mark = True
+            else:
+                self._pending_depths[holon_id] = current - 1
+
+        if should_mark:
+            if self._holon_service.get_holon_status(holon_id) == "frozen":
+                return
+            self._holon_service.mark_active(
+                holon_id,
+                reason="evolution_complete",
+                details={"service": "evolution_service"},
+            )
+
+    async def _run_with_pending_state(
+        self,
+        holon_id: str,
+        pending_token: Optional[str],
+        operation: "Callable[[], Awaitable[EvolutionResult]]",
+    ) -> EvolutionResult:
+        """Ensure the Holon is non-runnable while its skill evolution is in flight."""
+        await self._enter_pending(holon_id, pending_token=pending_token)
+        try:
+            return await operation()
+        finally:
+            await self._exit_pending(holon_id)
 
     # Public API ------------------------------------------------------------- #
 
@@ -345,69 +413,73 @@ class EvolutionService:
         description: str,
         tool_schema: ToolSchema,
         version: str = "0.1.0",
+        pending_token: Optional[str] = None,
     ) -> EvolutionResult:
         """Run full RGV and persist."""
-        red_result = await self._phase_red(tests)
-        if not red_result["passed"]:
-            return EvolutionResult(
-                success=False,
-                phase="red",
-                error_message=red_result["error"],
+        async def _operation() -> EvolutionResult:
+            red_result = await self._phase_red(tests)
+            if not red_result["passed"]:
+                return EvolutionResult(
+                    success=False,
+                    phase="red",
+                    error_message=red_result["error"],
+                )
+
+            red_contract_result = await self._phase_red_contract(tests, holon_id)
+            if not red_contract_result["passed"]:
+                return EvolutionResult(
+                    success=False,
+                    phase="red",
+                    error_message=red_contract_result["error"],
+                )
+
+            green_result = await self._phase_green(code, tests, holon_id)
+            if not green_result["passed"]:
+                return EvolutionResult(
+                    success=False,
+                    phase="green",
+                    error_message=green_result.get("error"),
+                )
+
+            verify_result = self._phase_verify(code)
+            if not verify_result["passed"]:
+                violation_msg = "; ".join(v.get("message", "") for v in verify_result.get("violations", []))
+                return EvolutionResult(
+                    success=False,
+                    phase="verify",
+                    error_message=violation_msg or "Security scan failed",
+                )
+
+            persist_result = await self._phase_persist(
+                holon_id=holon_id,
+                skill_name=skill_name,
+                code=code,
+                tests=tests,
+                description=description,
+                tool_schema=tool_schema,
+                version=version,
+                green_result=green_result,
+                verify_result=verify_result,
             )
 
-        red_contract_result = await self._phase_red_contract(tests, holon_id)
-        if not red_contract_result["passed"]:
+            if not persist_result["success"]:
+                return EvolutionResult(
+                    success=False,
+                    phase="persist",
+                    error_message=persist_result.get("error"),
+                )
+
             return EvolutionResult(
-                success=False,
-                phase="red",
-                error_message=red_contract_result["error"],
+                success=True,
+                phase="complete",
+                skill_id=persist_result["skill_id"],
+                attestation=persist_result["attestation"],
+                code_path=persist_result["code_path"],
+                test_path=persist_result["test_path"],
+                manifest_path=persist_result["manifest_path"],
             )
 
-        green_result = await self._phase_green(code, tests, holon_id)
-        if not green_result["passed"]:
-            return EvolutionResult(
-                success=False,
-                phase="green",
-                error_message=green_result.get("error"),
-            )
-
-        verify_result = self._phase_verify(code)
-        if not verify_result["passed"]:
-            violation_msg = "; ".join(v.get("message", "") for v in verify_result.get("violations", []))
-            return EvolutionResult(
-                success=False,
-                phase="verify",
-                error_message=violation_msg or "Security scan failed",
-            )
-
-        persist_result = await self._phase_persist(
-            holon_id=holon_id,
-            skill_name=skill_name,
-            code=code,
-            tests=tests,
-            description=description,
-            tool_schema=tool_schema,
-            version=version,
-            green_result=green_result,
-            verify_result=verify_result,
-        )
-
-        if not persist_result["success"]:
-            return EvolutionResult(
-                success=False,
-                phase="persist",
-                error_message=persist_result.get("error"),
-            )
-
-        return EvolutionResult(
-            success=True,
-            phase="complete",
-            skill_id=persist_result["skill_id"],
-            attestation=persist_result["attestation"],
-            code_path=persist_result["code_path"],
-            test_path=persist_result["test_path"],
-            manifest_path=persist_result["manifest_path"],
-        )
+        return await self._run_with_pending_state(holon_id, pending_token, _operation)
 
     async def evolve_skill_autonomous(
         self,
@@ -418,100 +490,106 @@ class EvolutionService:
         tool_schema: ToolSchema,
         version: str = "0.1.0",
         max_attempts: Optional[int] = None,
+        pending_token: Optional[str] = None,
     ) -> EvolutionResult:
         """End-to-end LLM-driven evolution (no hardcoded templates).
 
         Runs autonomous RGV with repair retries so Holons can iterate without
         hand-written scaffolding templates.
         """
-        configured_attempts = max_attempts if max_attempts is not None else settings.evolution_max_attempts
-        attempts = max(1, int(configured_attempts))
-        project_mode = self._detect_project_contract_mode(requirements)
-        if project_mode:
-            # Project incubation is a high-variance generation task; allow more repair rounds by default.
-            attempts = max(attempts, 6)
-            tests = self._build_project_contract_tests(requirements)
-        else:
-            tests = await self._generate_tests_via_llm(skill_name, description, requirements)
-            tests_validation: Dict[str, Any] = {"passed": False, "error": "tests validation not run"}
-            for _test_try in range(1, attempts + 1):
-                tests_validation = self._validate_generated_tests_contract(tests, requirements=requirements)
-                if tests_validation["passed"]:
-                    break
-                tests = await self._repair_tests_via_llm(
-                    skill_name=skill_name,
-                    description=description,
-                    requirements=requirements,
-                    previous_tests=tests,
-                    failure_message=tests_validation["error"] or "invalid test contract",
-                )
-
-            if not tests_validation["passed"]:
-                return EvolutionResult(
-                    success=False,
-                    phase="red",
-                    error_message=tests_validation["error"] or "unable to produce valid tests",
-                )
-
-        code = await self._generate_code_via_llm(skill_name, description, requirements, tests)
-        result = await self.evolve_skill(
-            holon_id=holon_id,
-            skill_name=skill_name,
-            code=code,
-            tests=tests,
-            description=description,
-            tool_schema=tool_schema,
-            version=version,
-        )
-        if result.success or attempts == 1:
-            return result
-
-        previous_code = code
-        previous_tests = tests
-        for _attempt in range(2, attempts + 1):
-            if result.phase == "red":
-                previous_tests = await self._repair_tests_via_llm(
-                    skill_name=skill_name,
-                    description=description,
-                    requirements=requirements,
-                    previous_tests=previous_tests,
-                    failure_message=result.error_message or "red phase failed",
-                )
-                validation = self._validate_generated_tests_contract(
-                    previous_tests,
-                    requirements=requirements,
-                )
-                if not validation["passed"]:
-                    continue
-                previous_code = await self._generate_code_via_llm(
-                    skill_name=skill_name,
-                    description=description,
-                    requirements=requirements,
-                    tests=previous_tests,
-                )
+        async def _operation() -> EvolutionResult:
+            configured_attempts = max_attempts if max_attempts is not None else settings.evolution_max_attempts
+            attempts = max(1, int(configured_attempts))
+            project_mode = self._detect_project_contract_mode(requirements)
+            if project_mode:
+                # Project incubation is a high-variance generation task; allow more repair rounds by default.
+                attempts = max(attempts, 6)
+                tests = self._build_project_contract_tests(requirements)
             else:
-                previous_code = await self._repair_code_via_llm(
-                    skill_name=skill_name,
-                    description=description,
-                    requirements=requirements,
-                    tests=previous_tests,
-                    previous_code=previous_code,
-                    failure_phase=result.phase,
-                    failure_message=result.error_message or "",
-                )
+                tests = await self._generate_tests_via_llm(skill_name, description, requirements)
+                tests_validation: Dict[str, Any] = {"passed": False, "error": "tests validation not run"}
+                for _test_try in range(1, attempts + 1):
+                    tests_validation = self._validate_generated_tests_contract(tests, requirements=requirements)
+                    if tests_validation["passed"]:
+                        break
+                    tests = await self._repair_tests_via_llm(
+                        skill_name=skill_name,
+                        description=description,
+                        requirements=requirements,
+                        previous_tests=tests,
+                        failure_message=tests_validation["error"] or "invalid test contract",
+                    )
 
+                if not tests_validation["passed"]:
+                    return EvolutionResult(
+                        success=False,
+                        phase="red",
+                        error_message=tests_validation["error"] or "unable to produce valid tests",
+                    )
+
+            code = await self._generate_code_via_llm(skill_name, description, requirements, tests)
             result = await self.evolve_skill(
                 holon_id=holon_id,
                 skill_name=skill_name,
-                code=previous_code,
-                tests=previous_tests,
+                code=code,
+                tests=tests,
                 description=description,
                 tool_schema=tool_schema,
                 version=version,
+                pending_token=pending_token,
             )
-            if result.success:
+            if result.success or attempts == 1:
                 return result
-        return result
+
+            previous_code = code
+            previous_tests = tests
+            for _attempt in range(2, attempts + 1):
+                if result.phase == "red":
+                    previous_tests = await self._repair_tests_via_llm(
+                        skill_name=skill_name,
+                        description=description,
+                        requirements=requirements,
+                        previous_tests=previous_tests,
+                        failure_message=result.error_message or "red phase failed",
+                    )
+                    validation = self._validate_generated_tests_contract(
+                        previous_tests,
+                        requirements=requirements,
+                    )
+                    if not validation["passed"]:
+                        continue
+                    previous_code = await self._generate_code_via_llm(
+                        skill_name=skill_name,
+                        description=description,
+                        requirements=requirements,
+                        tests=previous_tests,
+                    )
+                else:
+                    previous_code = await self._repair_code_via_llm(
+                        skill_name=skill_name,
+                        description=description,
+                        requirements=requirements,
+                        tests=previous_tests,
+                        previous_code=previous_code,
+                        failure_phase=result.phase,
+                        failure_message=result.error_message or "",
+                    )
+
+                result = await self.evolve_skill(
+                    holon_id=holon_id,
+                    skill_name=skill_name,
+                    code=previous_code,
+                    tests=previous_tests,
+                    description=description,
+                    tool_schema=tool_schema,
+                    version=version,
+                    pending_token=pending_token,
+                )
+                if result.success:
+                    return result
+            return result
+
+        return await self._run_with_pending_state(holon_id, pending_token, _operation)
 
     async def evolve_skill_with_test_cases(
         self,
@@ -522,34 +600,40 @@ class EvolutionService:
         test_cases: List[Dict[str, Any]],
         tool_schema: ToolSchema,
         version: str = "0.1.0",
+        pending_token: Optional[str] = None,
     ) -> EvolutionResult:
         """Evolve a skill from explicit test cases supplied by caller."""
-        if not test_cases:
-            return await self.evolve_skill_autonomous(
-                holon_id=holon_id,
+        async def _operation() -> EvolutionResult:
+            if not test_cases:
+                return await self.evolve_skill_autonomous(
+                    holon_id=holon_id,
+                    skill_name=skill_name,
+                    description=description,
+                    requirements=requirements,
+                    tool_schema=tool_schema,
+                    version=version,
+                    pending_token=pending_token,
+                )
+
+            tests = self._render_pytest_from_test_cases(test_cases)
+            code = await self._generate_code_via_llm(
                 skill_name=skill_name,
                 description=description,
                 requirements=requirements,
+                tests=tests,
+            )
+            return await self.evolve_skill(
+                holon_id=holon_id,
+                skill_name=skill_name,
+                code=code,
+                tests=tests,
+                description=description,
                 tool_schema=tool_schema,
                 version=version,
+                pending_token=pending_token,
             )
 
-        tests = self._render_pytest_from_test_cases(test_cases)
-        code = await self._generate_code_via_llm(
-            skill_name=skill_name,
-            description=description,
-            requirements=requirements,
-            tests=tests,
-        )
-        return await self.evolve_skill(
-            holon_id=holon_id,
-            skill_name=skill_name,
-            code=code,
-            tests=tests,
-            description=description,
-            tool_schema=tool_schema,
-            version=version,
-        )
+        return await self._run_with_pending_state(holon_id, pending_token, _operation)
 
     async def evolve_react_project_auto(self, *args, **kwargs) -> EvolutionResult:  # Compatibility stub
         """Previously hardcoded React generator has been removed."""
@@ -1115,8 +1199,8 @@ Mandatory rules:
                 "`new WebSocketServer({ server })` (ESM) or `new Server({ server })` (CJS import alias)."
             ),
             (
-                "Implement fish-eat-fish gameplay semantics in code/comments/tests: fish entities, "
-                "collision detection, devour/eat behavior, and growth (mass/size/score) updates."
+                "Implement gameplay/domain semantics strictly from project_goal and requirements; "
+                "do not inject unrelated genre/theme assumptions."
             ),
             (
                 "Gameplay modules must contain substantive logic (functions/state updates), "
@@ -1153,7 +1237,7 @@ Mandatory rules:
             inferred_min = EvolutionService._infer_project_min_file_count(requirements)
             add_hint(
                 "Ensure execute()['files'] contains at least "
-                f"{inferred_min} files with server/client/world/matchmaking/anti-cheat modules."
+                f"{inferred_min} files with modular server/client/runtime/security source modules."
             )
 
         placeholder_tokens = ("placeholder token in", "render logic", "todo", "tbd", "coming soon")
@@ -1175,6 +1259,16 @@ Mandatory rules:
             )
         if "process.env.port" in lower and "smoke" in lower:
             add_hint("Use process.env.PORT in smoke websocket URL; do not hardcode port 3000/8080.")
+        if "unexpected token" in lower and "ws-smoke" in lower:
+            add_hint(
+                "Fix JavaScript syntax in scripts/smoke/ws-smoke.mjs (balanced braces/parentheses and valid callback blocks)."
+            )
+        if "test_server_contains_health_and_ws_reply_logic" in lower and (
+            "snapshot" in lower or "state" in lower
+        ):
+            add_hint(
+                "In apps/server/src/server.mjs, send websocket messages containing both welcome and snapshot/state payloads."
+            )
 
         if "keyerror" in lower or ".format(" in lower or "brace" in lower:
             add_hint(
@@ -1191,11 +1285,11 @@ Mandatory rules:
 
         if "test_domain_modules_present_for_large_game" in lower or "missing_domain_module" in lower:
             add_hint(
-                "Provide concrete world, matchmaking, and anti-cheat modules in source file paths."
+                "Provide concrete modular runtime domains (for example world/state, matchmaking/sync, and anti-cheat/security) in source file paths."
             )
-        if "test_fish_gameplay_semantics_present" in lower:
+        if "test_gameplay_semantics_present" in lower:
             add_hint(
-                "Add explicit fish-eat-fish semantics: collision/overlap, devour/eat, and growth via mass/size/score."
+                "Ensure generated files explicitly implement project_goal-described gameplay/domain semantics with interaction and progression state updates."
             )
         if "test_gameplay_modules_have_substantive_logic" in lower:
             add_hint(
@@ -1251,10 +1345,73 @@ Mandatory rules:
         return 6
 
     @staticmethod
+    def _extract_project_goal_from_requirements(requirements: List[str]) -> str:
+        marker = "project goal:"
+        for req in requirements:
+            raw = str(req or "").strip()
+            if raw.lower().startswith(marker):
+                value = raw[len(marker):].strip()
+                if value:
+                    return value
+        return ""
+
+    @staticmethod
+    def _derive_goal_keywords(project_goal: str, limit: int = 16) -> List[str]:
+        text = str(project_goal or "").strip()
+        if not text:
+            return []
+
+        lowered = text.lower()
+        ascii_tokens = re.findall(r"[a-z0-9]{4,}", lowered)
+        cjk_tokens = re.findall(r"[\u4e00-\u9fff]{2,}", text)
+        stopwords = {
+            "build",
+            "project",
+            "game",
+            "must",
+            "include",
+            "with",
+            "that",
+            "this",
+            "and",
+            "from",
+            "using",
+            "构建",
+            "项目",
+            "必须",
+            "包含",
+            "支持",
+            "实现",
+            "多人在线",
+            "大型",
+            "系统",
+            "游戏",
+        }
+        keywords: List[str] = []
+        seen = set()
+        for token in ascii_tokens + cjk_tokens:
+            value = token.strip().lower()
+            if not value or value in stopwords:
+                continue
+            if value in seen:
+                continue
+            seen.add(value)
+            keywords.append(value)
+            if len(keywords) >= max(1, int(limit)):
+                break
+        return keywords
+
     def _build_project_contract_tests(requirements: List[str]) -> str:
         required_paths = EvolutionService._extract_required_paths_from_requirements(requirements)
         min_file_count = EvolutionService._infer_project_min_file_count(requirements)
+        project_goal = (
+            EvolutionService._extract_project_goal_from_requirements(requirements)
+            or "Build large multiplayer online game scaffold"
+        )
+        goal_keywords = EvolutionService._derive_goal_keywords(project_goal)
         required_literal = repr(required_paths)
+        goal_keywords_literal = repr(goal_keywords)
+        goal_literal = repr(project_goal)
         return f'''import inspect
 import json
 import os
@@ -1267,6 +1424,8 @@ import skill_module
 
 REQUIRED_PATHS = {required_literal}
 MIN_FILE_COUNT = {min_file_count}
+PROJECT_GOAL = {goal_literal}
+GOAL_KEYWORDS = {goal_keywords_literal}
 PLACEHOLDER_TOKENS = (
     "todo",
     "tbd",
@@ -1283,7 +1442,7 @@ PLACEHOLDER_TOKENS = (
 def _run_once():
     return skill_module.execute(
         project_name="Abyss Arena",
-        project_goal="Build MMO fish-eat-fish core scaffold",
+        project_goal=PROJECT_GOAL,
     )
 
 
@@ -1341,24 +1500,23 @@ def test_domain_modules_present_for_large_game():
     paths = [path.lower() for path in files.keys()]
     assert any("apps/server/" in path for path in paths)
     assert any("apps/client/" in path or "frontend/" in path for path in paths)
-    assert any("world" in path for path in paths)
-    assert any("match" in path for path in paths)
-    assert any("anti" in path and "cheat" in path for path in paths)
+    module_like = [
+        path for path in paths
+        if ("/src/" in path or path.startswith("scripts/")) and path.count("/") >= 2
+    ]
+    assert len(module_like) >= 6
 
 
-def test_fish_gameplay_semantics_present():
+def test_gameplay_semantics_present():
     out = _run_once()
     files = out["files"]
     corpus = "\\n".join(str(content).lower() for content in files.values())
-    fish_terms = ("fish", "大鱼", "小鱼")
-    eat_terms = ("eat", "devour", "consume", "吞噬")
-    grow_terms = ("grow", "growth", "mass", "size", "score", "成长")
-    collision_terms = ("collision", "overlap", "hitbox", "碰撞")
-    assert any(term in corpus for term in fish_terms)
-    assert any(term in corpus for term in eat_terms)
-    assert any(term in corpus for term in grow_terms)
-    assert any(term in corpus for term in collision_terms)
-    assert "move" in corpus
+    if not GOAL_KEYWORDS:
+        assert len(corpus) > 0
+        return
+    hits = [token for token in GOAL_KEYWORDS if token in corpus]
+    threshold = max(1, min(3, len(GOAL_KEYWORDS) // 3 if len(GOAL_KEYWORDS) >= 3 else 1))
+    assert len(hits) >= threshold, f"project goal semantics weakly represented: hits={{hits}} goal={{GOAL_KEYWORDS}}"
 
 
 def test_no_placeholder_tokens():
@@ -1391,20 +1549,7 @@ def test_gameplay_modules_have_substantive_logic():
         path
         for path in files.keys()
         if path.lower().endswith((".js", ".mjs", ".ts"))
-        and any(
-            token in path.lower()
-            for token in (
-                "world",
-                "match",
-                "anti-cheat",
-                "anticheat",
-                "fish",
-                "devour",
-                "growth",
-                "collision",
-                "movement",
-            )
-        )
+        and ("/src/" in path.lower() or path.lower().startswith("scripts/"))
     ]
     assert len(gameplay_paths) >= 6
     substantive_count = 0

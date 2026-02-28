@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from holonpolis.api.dependencies import get_genesis_service, get_holon_manager_dep
 from holonpolis.runtime.holon_manager import HolonManager
 from holonpolis.services.genesis_service import GenesisService, RouteResult
+from holonpolis.services.holon_service import HolonUnavailableError
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -118,6 +119,11 @@ async def chat(
             episode_increment=1,
             success=False,
         )
+        if isinstance(e, HolonUnavailableError):
+            raise HTTPException(
+                status_code=409,
+                detail=str(e),
+            )
         raise HTTPException(
             status_code=500,
             detail=f"Holon processing failed: {str(e)}",
@@ -151,6 +157,11 @@ async def chat_with_specific_holon(
         )
 
     except Exception as e:
+        if isinstance(e, HolonUnavailableError):
+            raise HTTPException(
+                status_code=409,
+                detail=str(e),
+            )
         raise HTTPException(
             status_code=500,
             detail=f"Holon processing failed: {str(e)}",
