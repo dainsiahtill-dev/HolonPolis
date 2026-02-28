@@ -62,6 +62,7 @@ class HolonService:
 
         # Create directory structure
         (holon_path / "workspace").mkdir(parents=True, exist_ok=True)
+        (holon_path / "skills").mkdir(parents=True, exist_ok=True)
         (holon_path / "skills_local").mkdir(parents=True, exist_ok=True)
         (holon_path / "memory" / "lancedb").mkdir(parents=True, exist_ok=True)
 

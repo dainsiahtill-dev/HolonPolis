@@ -91,6 +91,14 @@ async def chat(
             user_message=request.message,
         )
 
+        if route_result.route_id:
+            await genesis.genesis_memory.update_route_outcome(route_result.route_id, "success")
+        await genesis.genesis_memory.update_holon_stats(
+            holon_id=route_result.holon_id,
+            episode_increment=1,
+            success=True,
+        )
+
         latency_ms = int((time.time() - start) * 1000)
 
         return ChatResponse(
@@ -103,6 +111,13 @@ async def chat(
         )
 
     except Exception as e:
+        if route_result.route_id:
+            await genesis.genesis_memory.update_route_outcome(route_result.route_id, "failure")
+        await genesis.genesis_memory.update_holon_stats(
+            holon_id=route_result.holon_id,
+            episode_increment=1,
+            success=False,
+        )
         raise HTTPException(
             status_code=500,
             detail=f"Holon processing failed: {str(e)}",

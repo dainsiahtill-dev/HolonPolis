@@ -270,6 +270,24 @@ class TestGenesisMemory:
         assert route_id.startswith("route_")
 
     @pytest.mark.asyncio
+    async def test_update_route_outcome(self, genesis_setup, genesis_memory):
+        """测试更新路由决策结果."""
+        route_id = await genesis_memory.record_route_decision(
+            query="Need SQL optimization",
+            decision="route_to",
+            target_holon_id="holon_sql",
+            spawned_blueprint_id=None,
+            reasoning="SQL specialist",
+        )
+        await genesis_memory.update_route_outcome(route_id=route_id, outcome="success")
+
+        conn = genesis_memory._get_connection()
+        table = conn.get_table("routes")
+        rows = table.search().where(f"route_id = '{route_id}'").limit(100).to_list()
+        latest = max(rows, key=lambda row: row.get("created_at", ""))
+        assert latest["outcome"] == "success"
+
+    @pytest.mark.asyncio
     async def test_record_evolution(self, genesis_setup, genesis_memory):
         """测试记录演化尝试."""
         evolution_id = await genesis_memory.record_evolution(
@@ -285,6 +303,34 @@ class TestGenesisMemory:
         evolutions = await genesis_memory.get_holon_evolutions("holon_test")
         assert len(evolutions) >= 1
         assert evolutions[0]["skill_name"] == "file_parser"
+
+    @pytest.mark.asyncio
+    async def test_update_holon_stats(self, genesis_setup, genesis_memory):
+        """测试更新 Holon 统计信息."""
+        await genesis_memory.register_holon(
+            holon_id="holon_stats",
+            blueprint_id="bp_stats",
+            species_id="specialist",
+            name="Stats Holon",
+            purpose="Handle stats analysis tasks",
+            capabilities=["stats"],
+            skills=[],
+        )
+
+        await genesis_memory.update_holon_stats(
+            holon_id="holon_stats",
+            episode_increment=1,
+            success=True,
+        )
+
+        results = await genesis_memory.find_holons_for_task(
+            "stats analysis tasks",
+            top_k=3,
+        )
+        target = next((item for item in results if item["holon_id"] == "holon_stats"), None)
+        assert target is not None
+        assert target["total_episodes"] >= 1
+        assert target["success_rate"] > 0.0
 
 
 class TestBlueprintSerialization:

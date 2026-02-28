@@ -186,8 +186,8 @@ Style: Cyberpunk 2077 inspired with neon cyan/pink colors, dark theme, grid layo
 
         # 使用 React 项目生成方法 (使用更快的 LLM provider)
         # 优先使用: kimi-coding > minimax > ollama-local
-        provider_id = "kimi-coding"  # Kimi Coding (最快)
-        # provider_id = "minimax"  # MiniMax-M2.5 (备选)
+        # provider_id = "kimi-coding"  # Kimi Coding (403 错误)
+        provider_id = "minimax"  # MiniMax-M2.5 (OpenAI 兼容)
 
         print(f"   使用 LLM Provider: {provider_id}")
 

@@ -35,6 +35,13 @@ class GenesisMemory:
         """Get Genesis's LanceDB connection."""
         return self.factory.open("genesis")
 
+    @staticmethod
+    def _latest_record(records: List[Dict[str, Any]], key: str) -> Optional[Dict[str, Any]]:
+        """Pick the latest record by ISO timestamp field."""
+        if not records:
+            return None
+        return max(records, key=lambda item: item.get(key) or "")
+
     async def register_holon(
         self,
         holon_id: str,
@@ -81,15 +88,46 @@ class GenesisMemory:
         """Update holon statistics after episode completion."""
         conn = self._get_connection()
         table = conn.get_table("holons")
+        rows = table.search().where(f"holon_id = '{holon_id}'").limit(1000).to_list()
+        latest = self._latest_record(rows, "created_at")
+        if latest is None:
+            logger.warning("holon_stats_update_skipped", holon_id=holon_id, reason="holon_not_found")
+            return
 
-        # LanceDB doesn't support updates directly, so we need to:
-        # 1. Find the record
-        # 2. Delete it
-        # 3. Re-add with updated values
-        # For simplicity, we'll use a versioned approach
+        previous_total = int(latest.get("total_episodes", 0))
+        new_total = max(0, previous_total + int(episode_increment))
 
-        # TODO: Implement proper update logic with LanceDB
-        logger.debug("holon_stats_update", holon_id=holon_id)
+        prev_rate = float(latest.get("success_rate", 0.0))
+        if success is None or episode_increment <= 0:
+            new_success_rate = prev_rate
+        else:
+            prev_successes = int(round(previous_total * prev_rate))
+            new_successes = prev_successes + (1 if success else 0)
+            new_success_rate = float(new_successes / new_total) if new_total > 0 else 0.0
+
+        now = datetime.utcnow().isoformat()
+        table.add([{
+            "holon_id": latest["holon_id"],
+            "blueprint_id": latest["blueprint_id"],
+            "species_id": latest["species_id"],
+            "name": latest["name"],
+            "purpose": latest["purpose"],
+            "status": latest.get("status", "active"),
+            "capabilities": latest.get("capabilities", []),
+            "skills": latest.get("skills", []),
+            "total_episodes": new_total,
+            "success_rate": new_success_rate,
+            "last_active_at": now,
+            "created_at": now,
+            "embedding": latest["embedding"],
+        }])
+
+        logger.debug(
+            "holon_stats_updated",
+            holon_id=holon_id,
+            total_episodes=new_total,
+            success_rate=new_success_rate,
+        )
 
     async def find_holons_for_task(
         self,
@@ -104,8 +142,16 @@ class GenesisMemory:
         task_embedding = await self.embedder.embed_single(task_description)
 
         # Search by purpose embedding
-        results = table.search(task_embedding, vector_column_name="embedding").limit(top_k).to_list()
+        results = table.search(task_embedding, vector_column_name="embedding").limit(top_k * 5).to_list()
+        latest_by_holon: Dict[str, Dict[str, Any]] = {}
 
+        for row in results:
+            holon_id = row["holon_id"]
+            previous = latest_by_holon.get(holon_id)
+            if previous is None or row.get("created_at", "") > previous.get("created_at", ""):
+                latest_by_holon[holon_id] = row
+
+        deduped = list(latest_by_holon.values())[:top_k]
         return [
             {
                 "holon_id": r["holon_id"],
@@ -116,7 +162,7 @@ class GenesisMemory:
                 "success_rate": r["success_rate"],
                 "total_episodes": r["total_episodes"],
             }
-            for r in results
+            for r in deduped
         ]
 
     async def list_active_holons(self) -> List[Dict[str, Any]]:
@@ -125,7 +171,13 @@ class GenesisMemory:
         table = conn.get_table("holons")
 
         # Use filter for active status
-        results = table.search().where("status = 'active'").limit(1000).to_list()
+        results = table.search().where("status = 'active'").limit(5000).to_list()
+        latest_by_holon: Dict[str, Dict[str, Any]] = {}
+        for row in results:
+            holon_id = row["holon_id"]
+            previous = latest_by_holon.get(holon_id)
+            if previous is None or row.get("created_at", "") > previous.get("created_at", ""):
+                latest_by_holon[holon_id] = row
 
         return [
             {
@@ -136,7 +188,7 @@ class GenesisMemory:
                 "capabilities": r["capabilities"],
                 "success_rate": r["success_rate"],
             }
-            for r in results
+            for r in latest_by_holon.values()
         ]
 
     async def record_route_decision(
@@ -181,7 +233,27 @@ class GenesisMemory:
         outcome: str,  # success, failure
     ) -> None:
         """Update the outcome of a routing decision."""
-        # Similar to update_holon_stats, requires delete+re-add
+        conn = self._get_connection()
+        table = conn.get_table("routes")
+        rows = table.search().where(f"route_id = '{route_id}'").limit(1000).to_list()
+        latest = self._latest_record(rows, "created_at")
+        if latest is None:
+            logger.warning("route_outcome_update_skipped", route_id=route_id, reason="route_not_found")
+            return
+
+        now = datetime.utcnow().isoformat()
+        table.add([{
+            "route_id": latest["route_id"],
+            "query": latest["query"],
+            "query_embedding": latest["query_embedding"],
+            "decision": latest["decision"],
+            "target_holon_id": latest.get("target_holon_id"),
+            "spawned_blueprint_id": latest.get("spawned_blueprint_id"),
+            "reasoning": latest["reasoning"],
+            "outcome": outcome,
+            "created_at": now,
+        }])
+
         logger.info("route_outcome_updated", route_id=route_id, outcome=outcome)
 
     async def record_evolution(
@@ -230,7 +302,7 @@ class GenesisMemory:
 
         results = table.search().where(f"holon_id = '{holon_id}'").limit(1000).to_list()
 
-        return [
+        normalized = [
             {
                 "evolution_id": r["evolution_id"],
                 "skill_name": r["skill_name"],
@@ -240,3 +312,5 @@ class GenesisMemory:
             }
             for r in results
         ]
+        normalized.sort(key=lambda item: item.get("created_at", ""), reverse=True)
+        return normalized

@@ -29,6 +29,7 @@ class RouteResult:
     blueprint: Optional[Blueprint] = None
     reasoning: str = ""
     message: Optional[str] = None  # For clarify or deny
+    route_id: Optional[str] = None
 
 
 class GenesisService:
@@ -120,6 +121,7 @@ class GenesisService:
                 decision="route_to",
                 holon_id=decision.holon_id,
                 reasoning=decision.reasoning,
+                route_id=route_id,
             )
 
         elif isinstance(decision, SpawnDecision):
@@ -150,31 +152,50 @@ class GenesisService:
                 holon_id=holon_id,
                 blueprint=decision.blueprint,
                 reasoning=decision.reasoning,
+                route_id=route_id,
             )
 
         elif hasattr(decision, 'decision') and decision.decision == "deny":
             from holonpolis.genesis.evolution_lord import DenyDecision
+            route_id = await self.genesis_memory.record_route_decision(
+                query=user_request,
+                decision="deny",
+                target_holon_id=None,
+                spawned_blueprint_id=None,
+                reasoning=getattr(decision, "reason", "Denied by policy"),
+            )
             if isinstance(decision, DenyDecision):
                 return RouteResult(
                     decision="deny",
                     reasoning=decision.reason,
                     message=decision.suggested_alternative,
+                    route_id=route_id,
                 )
             return RouteResult(
                 decision="deny",
                 reasoning=getattr(decision, 'reason', 'Request denied by policy'),
+                route_id=route_id,
             )
 
         elif hasattr(decision, 'decision') and decision.decision == "clarify":
             from holonpolis.genesis.evolution_lord import ClarifyDecision
+            route_id = await self.genesis_memory.record_route_decision(
+                query=user_request,
+                decision="clarify",
+                target_holon_id=None,
+                spawned_blueprint_id=None,
+                reasoning=getattr(decision, "question", "Need clarification"),
+            )
             if isinstance(decision, ClarifyDecision):
                 return RouteResult(
                     decision="clarify",
                     message=decision.question,
+                    route_id=route_id,
                 )
             return RouteResult(
                 decision="clarify",
                 message=getattr(decision, 'question', 'Could you clarify your request?'),
+                route_id=route_id,
             )
 
         else:

@@ -55,6 +55,7 @@ class HolonPathGuard:
     ALLOWED_PREFIXES = frozenset({
         "memory",      # LanceDB 记忆存储
         "skills",      # 演化出的技能
+        "skills_local",  # 兼容旧目录命名
         "workspace",   # 工作空间
         "logs",        # 执行日志
         "temp",        # 临时文件
@@ -101,6 +102,11 @@ class HolonPathGuard:
     def skills_path(self) -> Path:
         """演化技能存储路径。"""
         return safe_join(self._holon_base, "skills")
+
+    @property
+    def skills_local_path(self) -> Path:
+        """本地演化技能路径（向后兼容）。"""
+        return safe_join(self._holon_base, "skills_local")
 
     @property
     def workspace_path(self) -> Path:
@@ -416,6 +422,7 @@ def create_holon_directories(holon_id: str) -> Path:
     # 创建所有标准目录
     guard.ensure_directory("memory/lancedb")
     guard.ensure_directory("skills")
+    guard.ensure_directory("skills_local")
     guard.ensure_directory("workspace")
     guard.ensure_directory("logs")
     guard.ensure_directory("temp")
