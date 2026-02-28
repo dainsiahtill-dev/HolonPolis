@@ -27,6 +27,7 @@ import structlog
 from holonpolis.config import settings
 from holonpolis.domain.skills import SkillManifest, SkillVersion, ToolSchema
 from holonpolis.infrastructure.time_utils import utc_now_iso
+from holonpolis.kernel.llm.provider_config import load_provider_bundle
 from holonpolis.kernel.llm.llm_runtime import LLMConfig, get_llm_runtime
 from holonpolis.kernel.sandbox import SandboxConfig, SandboxRunner
 from holonpolis.kernel.storage import HolonPathGuard
@@ -341,9 +342,11 @@ class EvolutionService:
     async def _enter_pending(self, holon_id: str, pending_token: Optional[str] = None) -> None:
         """Transition the Holon into pending once for the outermost evolution call."""
         should_mark = False
+        should_reset_audit = False
         async with self._pending_lock:
             current = int(self._pending_depths.get(holon_id, 0))
             if current == 0:
+                should_reset_audit = True
                 state = self._holon_service.get_holon_state(holon_id)
                 status = str(state.get("status") or "active")
                 if status == "frozen":
@@ -368,6 +371,8 @@ class EvolutionService:
                 reason="evolving_skill",
                 details=details,
             )
+        if should_reset_audit:
+            self._reset_evolution_audit(holon_id, pending_token)
 
     async def _exit_pending(self, holon_id: str) -> None:
         """Transition the Holon back to active when the outermost call completes."""
@@ -381,6 +386,14 @@ class EvolutionService:
                 self._pending_depths[holon_id] = current - 1
 
         if should_mark:
+            self._holon_service.update_evolution_audit(
+                holon_id,
+                patch={
+                    "lifecycle": "completed",
+                    "completed_at": utc_now_iso(),
+                    "llm": {"inflight": False},
+                },
+            )
             if self._holon_service.get_holon_status(holon_id) == "frozen":
                 return
             self._holon_service.mark_active(
@@ -402,6 +415,184 @@ class EvolutionService:
         finally:
             await self._exit_pending(holon_id)
 
+    def _resolve_llm_audit_metadata(self, config: Optional[LLMConfig]) -> Dict[str, str]:
+        """Resolve provider metadata for audit visibility without exposing secrets."""
+        bundle = load_provider_bundle()
+        provider_id = str(
+            (config.provider_id if config and config.provider_id else "")
+            or bundle.get("default_provider_id")
+            or settings.llm_provider
+            or ""
+        ).strip()
+        providers = bundle.get("providers")
+        provider_cfg: Dict[str, Any] = {}
+        if isinstance(providers, dict):
+            candidate = providers.get(provider_id)
+            if isinstance(candidate, dict):
+                provider_cfg = dict(candidate)
+        model = str(
+            (config.model if config and config.model else "")
+            or provider_cfg.get("model")
+            or ""
+        ).strip()
+        return {
+            "provider_id": provider_id,
+            "provider_type": str(provider_cfg.get("type") or "").strip(),
+            "model": model,
+        }
+
+    def _reset_evolution_audit(self, holon_id: str, pending_token: Optional[str]) -> None:
+        """Start a fresh audit window for the outermost evolution invocation."""
+        self._holon_service.update_evolution_audit(
+            holon_id,
+            patch={
+                "request_id": str(pending_token or ""),
+                "lifecycle": "pending",
+                "phase": "awaiting_llm",
+                "result": "in_progress",
+                "error": "",
+                "started_at": utc_now_iso(),
+                "completed_at": "",
+                "fallback_to_cached_skill": False,
+                "cache_reused_without_llm": False,
+                "llm": {
+                    "requested": False,
+                    "inflight": False,
+                    "call_count": 0,
+                    "success_count": 0,
+                    "failure_count": 0,
+                    "last_status": "not_started",
+                    "last_stage": "",
+                    "provider_id": "",
+                    "provider_type": "",
+                    "model": "",
+                    "last_error": "",
+                    "last_latency_ms": 0,
+                    "last_started_at": "",
+                    "last_completed_at": "",
+                },
+            },
+        )
+
+    def _snapshot_llm_counters(self, holon_id: str) -> Dict[str, int]:
+        """Read current per-evolution LLM counters from persisted state."""
+        state = self._holon_service.get_holon_state(holon_id)
+        audit = state.get("evolution_audit")
+        if not isinstance(audit, dict):
+            audit = {}
+        llm = audit.get("llm")
+        if not isinstance(llm, dict):
+            llm = {}
+        return {
+            "call_count": int(llm.get("call_count", 0) or 0),
+            "success_count": int(llm.get("success_count", 0) or 0),
+            "failure_count": int(llm.get("failure_count", 0) or 0),
+        }
+
+    async def _chat_with_audit(
+        self,
+        *,
+        holon_id: str,
+        pending_token: Optional[str],
+        stage: str,
+        system_prompt: str,
+        user_prompt: str,
+        config: Optional[LLMConfig],
+    ):
+        """Wrap LLM chat so state.json shows whether a real LLM request is in flight."""
+        metadata = self._resolve_llm_audit_metadata(config)
+        counters = self._snapshot_llm_counters(holon_id)
+        started_at = utc_now_iso()
+        self._holon_service.update_evolution_audit(
+            holon_id,
+            patch={
+                "request_id": str(pending_token or ""),
+                "lifecycle": "running",
+                "phase": str(stage),
+                "result": "in_progress",
+                "error": "",
+                "fallback_to_cached_skill": False,
+                "llm": {
+                    "requested": True,
+                    "inflight": True,
+                    "call_count": counters["call_count"] + 1,
+                    "success_count": counters["success_count"],
+                    "failure_count": counters["failure_count"],
+                    "last_status": "started",
+                    "last_stage": str(stage),
+                    "provider_id": metadata["provider_id"],
+                    "provider_type": metadata["provider_type"],
+                    "model": metadata["model"],
+                    "last_error": "",
+                    "last_latency_ms": 0,
+                    "last_started_at": started_at,
+                },
+            },
+        )
+        try:
+            response = await self._llm.chat(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                config=config,
+            )
+        except Exception as exc:
+            finished_at = utc_now_iso()
+            self._holon_service.update_evolution_audit(
+                holon_id,
+                patch={
+                    "request_id": str(pending_token or ""),
+                    "lifecycle": "running",
+                    "phase": str(stage),
+                    "result": "in_progress",
+                    "error": str(exc),
+                    "llm": {
+                        "requested": True,
+                        "inflight": False,
+                        "call_count": counters["call_count"] + 1,
+                        "success_count": counters["success_count"],
+                        "failure_count": counters["failure_count"] + 1,
+                        "last_status": "failed",
+                        "last_stage": str(stage),
+                        "provider_id": metadata["provider_id"],
+                        "provider_type": metadata["provider_type"],
+                        "model": metadata["model"],
+                        "last_error": str(exc),
+                        "last_latency_ms": 0,
+                        "last_completed_at": finished_at,
+                    },
+                },
+            )
+            raise
+
+        finished_at = utc_now_iso()
+        resolved_model = str(getattr(response, "model", "") or metadata["model"]).strip()
+        self._holon_service.update_evolution_audit(
+            holon_id,
+            patch={
+                "request_id": str(pending_token or ""),
+                "lifecycle": "running",
+                "phase": str(stage),
+                "result": "in_progress",
+                "error": "",
+                "llm": {
+                    "requested": True,
+                    "inflight": False,
+                    "call_count": counters["call_count"] + 1,
+                    "success_count": counters["success_count"] + 1,
+                    "failure_count": counters["failure_count"],
+                    "last_status": "succeeded",
+                    "last_stage": str(stage),
+                    "provider_id": metadata["provider_id"],
+                    "provider_type": metadata["provider_type"],
+                    "model": resolved_model,
+                    "last_error": "",
+                    "last_latency_ms": int(getattr(response, "latency_ms", 0) or 0),
+                    "last_completed_at": finished_at,
+                },
+            },
+        )
+        return response
+
     # Public API ------------------------------------------------------------- #
 
     async def evolve_skill(
@@ -417,8 +608,16 @@ class EvolutionService:
     ) -> EvolutionResult:
         """Run full RGV and persist."""
         async def _operation() -> EvolutionResult:
+            self._holon_service.update_evolution_audit(
+                holon_id,
+                patch={"lifecycle": "running", "phase": "red", "result": "in_progress", "error": ""},
+            )
             red_result = await self._phase_red(tests)
             if not red_result["passed"]:
+                self._holon_service.update_evolution_audit(
+                    holon_id,
+                    patch={"phase": "red", "result": "failed", "error": str(red_result["error"] or "")},
+                )
                 return EvolutionResult(
                     success=False,
                     phase="red",
@@ -427,29 +626,61 @@ class EvolutionService:
 
             red_contract_result = await self._phase_red_contract(tests, holon_id)
             if not red_contract_result["passed"]:
+                self._holon_service.update_evolution_audit(
+                    holon_id,
+                    patch={"phase": "red", "result": "failed", "error": str(red_contract_result["error"] or "")},
+                )
                 return EvolutionResult(
                     success=False,
                     phase="red",
                     error_message=red_contract_result["error"],
                 )
 
+            self._holon_service.update_evolution_audit(
+                holon_id,
+                patch={"phase": "green", "result": "in_progress", "error": ""},
+            )
             green_result = await self._phase_green(code, tests, holon_id)
             if not green_result["passed"]:
+                self._holon_service.update_evolution_audit(
+                    holon_id,
+                    patch={
+                        "phase": "green",
+                        "result": "failed",
+                        "error": str(green_result.get("error") or ""),
+                    },
+                )
                 return EvolutionResult(
                     success=False,
                     phase="green",
                     error_message=green_result.get("error"),
                 )
 
+            self._holon_service.update_evolution_audit(
+                holon_id,
+                patch={"phase": "verify", "result": "in_progress", "error": ""},
+            )
             verify_result = self._phase_verify(code)
             if not verify_result["passed"]:
                 violation_msg = "; ".join(v.get("message", "") for v in verify_result.get("violations", []))
+                self._holon_service.update_evolution_audit(
+                    holon_id,
+                    patch={
+                        "phase": "verify",
+                        "result": "failed",
+                        "error": str(violation_msg or "Security scan failed"),
+                    },
+                )
                 return EvolutionResult(
                     success=False,
                     phase="verify",
                     error_message=violation_msg or "Security scan failed",
                 )
 
+            self._holon_service.update_evolution_audit(
+                holon_id,
+                patch={"phase": "persist", "result": "in_progress", "error": ""},
+            )
             persist_result = await self._phase_persist(
                 holon_id=holon_id,
                 skill_name=skill_name,
@@ -477,6 +708,16 @@ class EvolutionService:
                 code_path=persist_result["code_path"],
                 test_path=persist_result["test_path"],
                 manifest_path=persist_result["manifest_path"],
+            )
+            self._holon_service.update_evolution_audit(
+                holon_id,
+                patch={
+                    "phase": "persist",
+                    "result": "success",
+                    "error": "",
+                    "skill_id": slug,
+                    "attestation_id": attestation.attestation_id,
+                },
             )
 
         return await self._run_with_pending_state(holon_id, pending_token, _operation)
@@ -506,18 +747,26 @@ class EvolutionService:
                 attempts = max(attempts, 6)
                 tests = self._build_project_contract_tests(requirements)
             else:
-                tests = await self._generate_tests_via_llm(skill_name, description, requirements)
+                tests = await self._generate_tests_via_llm(
+                    holon_id=holon_id,
+                    skill_name=skill_name,
+                    description=description,
+                    requirements=requirements,
+                    pending_token=pending_token,
+                )
                 tests_validation: Dict[str, Any] = {"passed": False, "error": "tests validation not run"}
                 for _test_try in range(1, attempts + 1):
                     tests_validation = self._validate_generated_tests_contract(tests, requirements=requirements)
                     if tests_validation["passed"]:
                         break
                     tests = await self._repair_tests_via_llm(
+                        holon_id=holon_id,
                         skill_name=skill_name,
                         description=description,
                         requirements=requirements,
                         previous_tests=tests,
                         failure_message=tests_validation["error"] or "invalid test contract",
+                        pending_token=pending_token,
                     )
 
                 if not tests_validation["passed"]:
@@ -527,7 +776,14 @@ class EvolutionService:
                         error_message=tests_validation["error"] or "unable to produce valid tests",
                     )
 
-            code = await self._generate_code_via_llm(skill_name, description, requirements, tests)
+            code = await self._generate_code_via_llm(
+                holon_id=holon_id,
+                skill_name=skill_name,
+                description=description,
+                requirements=requirements,
+                tests=tests,
+                pending_token=pending_token,
+            )
             result = await self.evolve_skill(
                 holon_id=holon_id,
                 skill_name=skill_name,
@@ -546,11 +802,13 @@ class EvolutionService:
             for _attempt in range(2, attempts + 1):
                 if result.phase == "red":
                     previous_tests = await self._repair_tests_via_llm(
+                        holon_id=holon_id,
                         skill_name=skill_name,
                         description=description,
                         requirements=requirements,
                         previous_tests=previous_tests,
                         failure_message=result.error_message or "red phase failed",
+                        pending_token=pending_token,
                     )
                     validation = self._validate_generated_tests_contract(
                         previous_tests,
@@ -559,13 +817,16 @@ class EvolutionService:
                     if not validation["passed"]:
                         continue
                     previous_code = await self._generate_code_via_llm(
+                        holon_id=holon_id,
                         skill_name=skill_name,
                         description=description,
                         requirements=requirements,
                         tests=previous_tests,
+                        pending_token=pending_token,
                     )
                 else:
                     previous_code = await self._repair_code_via_llm(
+                        holon_id=holon_id,
                         skill_name=skill_name,
                         description=description,
                         requirements=requirements,
@@ -573,6 +834,7 @@ class EvolutionService:
                         previous_code=previous_code,
                         failure_phase=result.phase,
                         failure_message=result.error_message or "",
+                        pending_token=pending_token,
                     )
 
                 result = await self.evolve_skill(
@@ -617,10 +879,12 @@ class EvolutionService:
 
             tests = self._render_pytest_from_test_cases(test_cases)
             code = await self._generate_code_via_llm(
+                holon_id=holon_id,
                 skill_name=skill_name,
                 description=description,
                 requirements=requirements,
                 tests=tests,
+                pending_token=pending_token,
             )
             return await self.evolve_skill(
                 holon_id=holon_id,
@@ -869,9 +1133,11 @@ class EvolutionService:
 
     async def _generate_tests_via_llm(
         self,
+        holon_id: str,
         skill_name: str,
         description: str,
         requirements: List[str],
+        pending_token: Optional[str] = None,
     ) -> str:
         req_text = "\n".join(f"- {r}" for r in requirements)
         system_prompt = (
@@ -901,7 +1167,10 @@ Rules:
             temperature=0.2,
             max_tokens=4000,
         )
-        response = await self._llm.chat(
+        response = await self._chat_with_audit(
+            holon_id=holon_id,
+            pending_token=pending_token,
+            stage="generate_tests",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             config=config,
@@ -910,10 +1179,12 @@ Rules:
 
     async def _generate_code_via_llm(
         self,
+        holon_id: str,
         skill_name: str,
         description: str,
         requirements: List[str],
         tests: str,
+        pending_token: Optional[str] = None,
     ) -> str:
         req_text = "\n".join(f"- {r}" for r in requirements)
         project_rules = self._project_generation_rules(requirements)
@@ -948,7 +1219,10 @@ Implementation rules:
             temperature=0.3,
             max_tokens=8000,
         )
-        response = await self._llm.chat(
+        response = await self._chat_with_audit(
+            holon_id=holon_id,
+            pending_token=pending_token,
+            stage="generate_code",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             config=config,
@@ -957,6 +1231,7 @@ Implementation rules:
 
     async def _repair_code_via_llm(
         self,
+        holon_id: str,
         skill_name: str,
         description: str,
         requirements: List[str],
@@ -964,6 +1239,7 @@ Implementation rules:
         previous_code: str,
         failure_phase: str,
         failure_message: str,
+        pending_token: Optional[str] = None,
     ) -> str:
         """Repair generated code from RGV feedback without introducing templates."""
         req_text = "\n".join(f"- {r}" for r in requirements)
@@ -1005,7 +1281,10 @@ Repair rules:
             temperature=0.1,
             max_tokens=8000,
         )
-        response = await self._llm.chat(
+        response = await self._chat_with_audit(
+            holon_id=holon_id,
+            pending_token=pending_token,
+            stage="repair_code",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             config=config,
@@ -1014,11 +1293,13 @@ Repair rules:
 
     async def _repair_tests_via_llm(
         self,
+        holon_id: str,
         skill_name: str,
         description: str,
         requirements: List[str],
         previous_tests: str,
         failure_message: str,
+        pending_token: Optional[str] = None,
     ) -> str:
         """Repair test suite contract when Red phase validation fails."""
         req_text = "\n".join(f"- {r}" for r in requirements)
@@ -1050,7 +1331,10 @@ Mandatory rules:
             temperature=0.1,
             max_tokens=6000,
         )
-        response = await self._llm.chat(
+        response = await self._chat_with_audit(
+            holon_id=holon_id,
+            pending_token=pending_token,
+            stage="repair_tests",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             config=config,

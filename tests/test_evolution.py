@@ -15,6 +15,7 @@ import pytest
 from holonpolis.domain import Blueprint, Boundary, EvolutionPolicy
 from holonpolis.domain.skills import ToolSchema
 from holonpolis.kernel.embeddings.default_embedder import set_embedder, SimpleEmbedder
+from holonpolis.kernel.llm.llm_runtime import LLMResponse
 from holonpolis.kernel.lancedb import get_lancedb_factory, reset_factory
 from holonpolis.kernel.storage import HolonPathGuard
 from holonpolis.services.evolution_service import (
@@ -218,6 +219,88 @@ async def test_evolution_service_marks_holon_pending_during_run(evolution_setup,
     assert result.phase == "red"
     assert observed["status_during_red"] == "pending"
     assert HolonService().get_holon_status(holon_id) == "active"
+
+
+@pytest.mark.asyncio
+async def test_evolution_service_persists_llm_audit_state(evolution_setup, monkeypatch):
+    """Successful LLM requests should be visible in state.json even after pending clears."""
+    holon_id = "llm_audit_holon"
+    await HolonService().create_holon(
+        Blueprint(
+            blueprint_id=f"bp_{holon_id}",
+            holon_id=holon_id,
+            species_id="generalist",
+            name="LLM Audit",
+            purpose="Verify LLM audit persistence",
+            boundary=Boundary(),
+            evolution_policy=EvolutionPolicy(),
+        )
+    )
+
+    service = EvolutionService()
+    llm_calls = {"count": 0}
+
+    async def fake_chat(**kwargs):
+        llm_calls["count"] += 1
+        if llm_calls["count"] == 1:
+            return LLMResponse(
+                content=(
+                    "from skill_module import execute\n\n"
+                    "def test_execute():\n"
+                    "    assert execute({\"value\": 1}) is not None\n"
+                ),
+                model="audit-test-model",
+                latency_ms=11,
+            )
+        return LLMResponse(
+            content=(
+                "def execute(payload=None):\n"
+                "    return {\"ok\": True, \"payload\": payload or {}}\n"
+            ),
+            model="audit-test-model",
+            latency_ms=17,
+        )
+
+    async def fake_evolve_skill(**kwargs):
+        return EvolutionResult(success=False, phase="green", error_message="stop_after_audit")
+
+    monkeypatch.setattr(service._llm, "chat", fake_chat)
+    monkeypatch.setattr(service, "evolve_skill", fake_evolve_skill)
+
+    result = await service.evolve_skill_autonomous(
+        holon_id=holon_id,
+        skill_name="AuditSkill",
+        description="Check LLM audit fields",
+        requirements=["Return a deterministic payload"],
+        tool_schema=ToolSchema(
+            name="execute",
+            description="Audit-only",
+            parameters={"type": "object", "properties": {}},
+        ),
+        max_attempts=1,
+        pending_token="audit-request-001",
+    )
+
+    state = HolonService().get_holon_state(holon_id)
+    audit = state.get("evolution_audit")
+    assert isinstance(audit, dict)
+    llm = audit.get("llm")
+    assert isinstance(llm, dict)
+    assert result.success is False
+    assert llm_calls["count"] == 2
+    assert state["status"] == "active"
+    assert audit["request_id"] == "audit-request-001"
+    assert audit["lifecycle"] == "completed"
+    assert audit["phase"] == "generate_code"
+    assert audit["result"] == "in_progress"
+    assert llm["requested"] is True
+    assert llm["inflight"] is False
+    assert llm["call_count"] == 2
+    assert llm["success_count"] == 2
+    assert llm["failure_count"] == 0
+    assert llm["last_status"] == "succeeded"
+    assert llm["last_stage"] == "generate_code"
+    assert llm["model"] == "audit-test-model"
 
 
 class TestGreenPhase:
@@ -561,7 +644,14 @@ class TestEvolutionFromTestCases:
     async def test_evolve_skill_with_explicit_test_cases(self, evolution_setup, tool_schema, monkeypatch):
         service = EvolutionService()
 
-        async def fake_generate_code(skill_name, description, requirements, tests):
+        async def fake_generate_code(
+            holon_id,
+            skill_name,
+            description,
+            requirements,
+            tests,
+            pending_token=None,
+        ):
             assert "test_case_1" in tests
             return """
 def execute(a, b):
@@ -600,7 +690,13 @@ def execute(a, b):
     ):
         service = EvolutionService()
 
-        async def fake_generate_tests(skill_name, description, requirements):
+        async def fake_generate_tests(
+            holon_id,
+            skill_name,
+            description,
+            requirements,
+            pending_token=None,
+        ):
             return """
 from skill_module import execute
 
@@ -608,13 +704,21 @@ def test_execute():
     assert execute(2, 3) == 5
 """
 
-        async def fake_generate_code(skill_name, description, requirements, tests):
+        async def fake_generate_code(
+            holon_id,
+            skill_name,
+            description,
+            requirements,
+            tests,
+            pending_token=None,
+        ):
             return """
 def execute(a, b):
     return a - b
 """
 
         async def fake_repair(
+            holon_id,
             skill_name,
             description,
             requirements,
@@ -622,6 +726,7 @@ def execute(a, b):
             previous_code,
             failure_phase,
             failure_message,
+            pending_token=None,
         ):
             assert failure_phase == "green"
             assert "pytest failed" in failure_message
@@ -658,7 +763,13 @@ def execute(a, b):
         service = EvolutionService()
         call_state = {"tests_generated": 0, "tests_repaired": 0}
 
-        async def fake_generate_tests(skill_name, description, requirements):
+        async def fake_generate_tests(
+            holon_id,
+            skill_name,
+            description,
+            requirements,
+            pending_token=None,
+        ):
             call_state["tests_generated"] += 1
             return """
 def execute(a, b):
@@ -669,11 +780,13 @@ def test_weak():
 """
 
         async def fake_repair_tests(
+            holon_id,
             skill_name,
             description,
             requirements,
             previous_tests,
             failure_message,
+            pending_token=None,
         ):
             call_state["tests_repaired"] += 1
             assert "import from skill_module" in failure_message
@@ -684,7 +797,14 @@ def test_execute():
     assert execute(2, 3) == 5
 """
 
-        async def fake_generate_code(skill_name, description, requirements, tests):
+        async def fake_generate_code(
+            holon_id,
+            skill_name,
+            description,
+            requirements,
+            tests,
+            pending_token=None,
+        ):
             assert "from skill_module import execute" in tests
             return """
 def execute(a, b):

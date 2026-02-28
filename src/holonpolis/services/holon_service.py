@@ -26,6 +26,18 @@ _STATUS_FROZEN = "frozen"
 _VALID_STATUSES = frozenset({_STATUS_ACTIVE, _STATUS_PENDING, _STATUS_FROZEN})
 
 
+def _deep_merge_dicts(base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively merge dict patches while preserving unrelated keys."""
+    result = dict(base)
+    for key, value in patch.items():
+        current = result.get(key)
+        if isinstance(current, dict) and isinstance(value, dict):
+            result[key] = _deep_merge_dicts(current, value)
+        else:
+            result[key] = value
+    return result
+
+
 class HolonUnavailableError(RuntimeError):
     """Raised when a Holon cannot accept runtime work in its current state."""
 
@@ -114,17 +126,12 @@ class HolonService:
         """Persist a Holon runtime status transition."""
         normalized = str(status or _STATUS_ACTIVE).strip().lower()
         existing = self._read_state(holon_id)
-        payload: Dict[str, Any] = {
-            "status": normalized,
-        }
+        payload: Dict[str, Any] = dict(existing)
+        payload["status"] = normalized
         if reason:
             payload["reason"] = str(reason)
-        elif "reason" in existing:
-            payload["reason"] = existing["reason"]
         if isinstance(details, dict) and details:
             payload["details"] = dict(details)
-        elif "details" in existing:
-            payload["details"] = existing["details"]
 
         if normalized == _STATUS_PENDING:
             payload["pending_at"] = utc_now_iso()
@@ -162,6 +169,22 @@ class HolonService:
     ) -> Dict[str, Any]:
         """Mark a Holon as active/runnable."""
         return self.set_holon_status(holon_id, _STATUS_ACTIVE, reason=reason, details=details)
+
+    def update_evolution_audit(
+        self,
+        holon_id: str,
+        patch: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Merge audit metadata into state.json without disturbing status fields."""
+        existing = self._read_state(holon_id)
+        audit = existing.get("evolution_audit")
+        if not isinstance(audit, dict):
+            audit = {}
+        if isinstance(patch, dict) and patch:
+            audit = _deep_merge_dicts(audit, patch)
+        audit["updated_at"] = utc_now_iso()
+        existing["evolution_audit"] = audit
+        return self._write_state(holon_id, existing)
 
     def is_pending(self, holon_id: str) -> bool:
         """Check if a Holon is pending."""

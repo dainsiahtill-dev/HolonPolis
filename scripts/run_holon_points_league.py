@@ -252,6 +252,80 @@ def _read_skill_code_hash(holon_id: str, skill_id: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+def _empty_llm_audit() -> Dict[str, Any]:
+    return {
+        "requested": False,
+        "inflight": False,
+        "call_count": 0,
+        "success_count": 0,
+        "failure_count": 0,
+        "last_status": "not_requested",
+        "last_stage": "",
+        "provider_id": "",
+        "provider_type": "",
+        "model": "",
+        "last_error": "",
+        "last_latency_ms": 0,
+        "last_started_at": "",
+        "last_completed_at": "",
+    }
+
+
+def _mark_cached_reuse_audit(
+    holon_service: HolonService,
+    holon_id: str,
+    *,
+    phase_label: str,
+) -> None:
+    holon_service.update_evolution_audit(
+        holon_id,
+        patch={
+            "request_id": "",
+            "lifecycle": "idle",
+            "phase": str(phase_label),
+            "result": "cached_reuse",
+            "error": "",
+            "fallback_to_cached_skill": False,
+            "cache_reused_without_llm": True,
+            "llm": _empty_llm_audit(),
+        },
+    )
+
+
+def _mark_cached_fallback_audit(
+    holon_service: HolonService,
+    holon_id: str,
+    *,
+    phase_label: str,
+    error: str,
+) -> None:
+    holon_service.update_evolution_audit(
+        holon_id,
+        patch={
+            "phase": str(phase_label),
+            "result": "fallback_cached",
+            "error": str(error or ""),
+            "fallback_to_cached_skill": True,
+            "cache_reused_without_llm": False,
+            "llm": {
+                "inflight": False,
+                "last_status": "fallback_cached",
+                "last_error": str(error or ""),
+            },
+        },
+    )
+
+
+def _resolve_evolution_concurrency(args: argparse.Namespace) -> int:
+    configured = getattr(args, "evolution_concurrency", None)
+    if configured is not None:
+        return max(1, int(configured))
+    base = max(1, int(args.concurrency))
+    if (bool(args.require_llm_evolution) or bool(args.force_evolve)) and int(args.population_size) > 1:
+        return max(2, base)
+    return base
+
+
 def _tool_schema() -> ToolSchema:
     return ToolSchema(
         name="execute",
@@ -427,6 +501,7 @@ async def _ensure_population(
 
 async def _ensure_skill(
     holon_id: str,
+    holon_service: HolonService,
     evo: EvolutionService,
     skill_name: str,
     schema: ToolSchema,
@@ -446,6 +521,11 @@ async def _ensure_skill(
         status = await evo.validate_existing_skill(holon_id, skill_name)
         cached_valid = bool(status.get("valid"))
         if cached_valid and not require_llm_evolution:
+            _mark_cached_reuse_audit(
+                holon_service,
+                holon_id,
+                phase_label=phase_label,
+            )
             _emit_progress(
                 "evolve",
                 f"{phase_label} {holon_id} reuse cached skill={slug}",
@@ -513,6 +593,20 @@ async def _ensure_skill(
 
     error = f"evolve_failed after {attempts} outer tries error={last_error}"
     if strict_llm_evolution:
+        holon_service.update_evolution_audit(
+            holon_id,
+            patch={
+                "phase": str(phase_label),
+                "result": "failed_strict",
+                "error": str(error),
+                "fallback_to_cached_skill": False,
+                "llm": {
+                    "inflight": False,
+                    "last_status": "failed_strict",
+                    "last_error": str(error),
+                },
+            },
+        )
         _emit_progress(
             "evolve",
             f"{phase_label} {holon_id} fail strict reason={_compact_error_text(error, limit=220)}",
@@ -523,11 +617,31 @@ async def _ensure_skill(
         status = await evo.validate_existing_skill(holon_id, skill_name)
         cached_valid = bool(status.get("valid"))
     if cached_valid:
+        _mark_cached_fallback_audit(
+            holon_service,
+            holon_id,
+            phase_label=phase_label,
+            error=error,
+        )
         _emit_progress(
             "evolve",
             f"{phase_label} {holon_id} fallback cached skill={slug}",
         )
         return slug, _read_skill_code_hash(holon_id, slug), False
+    holon_service.update_evolution_audit(
+        holon_id,
+        patch={
+            "phase": str(phase_label),
+            "result": "failed",
+            "error": str(error),
+            "fallback_to_cached_skill": False,
+            "llm": {
+                "inflight": False,
+                "last_status": "failed",
+                "last_error": str(error),
+            },
+        },
+    )
     _emit_progress(
         "evolve",
         f"{phase_label} {holon_id} fail reason={_compact_error_text(error, limit=220)}",
@@ -547,18 +661,19 @@ async def _prepare_predictors(
     strict_llm_evolution: bool,
     llm_max_attempts: int,
     llm_outer_retries: int,
-    concurrency: int,
+    evolution_concurrency: int,
 ) -> Dict[str, PredictorHandle]:
     _emit_progress(
         "batch",
-        f"init-evolve holons={len(holon_ids)} concurrency={max(1, int(concurrency))}",
+        f"init-evolve holons={len(holon_ids)} evolution_concurrency={max(1, int(evolution_concurrency))}",
     )
-    sem = asyncio.Semaphore(max(1, int(concurrency)))
+    sem = asyncio.Semaphore(max(1, int(evolution_concurrency)))
 
     async def _build_for(hid: str) -> tuple[str, PredictorHandle]:
         async with sem:
             skill_id, code_hash, llm_evolved = await _ensure_skill(
                 holon_id=hid,
+                holon_service=holon_service,
                 evo=evo,
                 skill_name=skill_name,
                 schema=schema,
@@ -615,19 +730,20 @@ async def _re_evolve_predictors(
     llm_max_attempts: int,
     llm_outer_retries: int,
     strict_llm_evolution: bool,
-    concurrency: int,
+    evolution_concurrency: int,
 ) -> Dict[str, PredictorHandle]:
     _emit_progress(
         "batch",
-        f"re-evolve { _evolution_phase_label(round_index) } holons={len(predictors)} concurrency={max(1, int(concurrency))}",
+        f"re-evolve { _evolution_phase_label(round_index) } holons={len(predictors)} evolution_concurrency={max(1, int(evolution_concurrency))}",
     )
-    sem = asyncio.Semaphore(max(1, int(concurrency)))
+    sem = asyncio.Semaphore(max(1, int(evolution_concurrency)))
 
     async def _refresh_one(hid: str) -> tuple[str, PredictorHandle]:
         async with sem:
             state = scoreboard[hid]
             skill_id, code_hash, llm_evolved = await _ensure_skill(
                 holon_id=hid,
+                holon_service=holon_service,
                 evo=evo,
                 skill_name=skill_name,
                 schema=schema,
@@ -696,6 +812,16 @@ async def run_league(args: argparse.Namespace) -> int:
         raise ValueError("llm_max_attempts must be > 0")
     if int(args.llm_outer_retries) <= 0:
         raise ValueError("llm_outer_retries must be > 0")
+    evolution_concurrency = _resolve_evolution_concurrency(args)
+    if (
+        (bool(args.require_llm_evolution) or bool(args.force_evolve))
+        and int(args.population_size) > 1
+        and getattr(args, "evolution_concurrency", None) is not None
+        and evolution_concurrency < 2
+    ):
+        raise ValueError(
+            "evolution_concurrency must be >= 2 when LLM evolution is enabled for multiple Holons."
+        )
 
     llm_provider_info: Dict[str, str] = {}
     if bool(args.require_llm_evolution) or bool(args.force_evolve):
@@ -706,6 +832,10 @@ async def run_league(args: argparse.Namespace) -> int:
             f"{llm_provider_info.get('provider_id', '-')}"
             f" type={llm_provider_info.get('provider_type', '-')}"
             f" model={llm_provider_info.get('model', '-')}",
+        )
+        _emit_progress(
+            "llm",
+            f"evolution_concurrency={int(evolution_concurrency)} prediction_concurrency={max(1, int(args.concurrency))}",
         )
 
     train_rows = _normalize_rows(_read_json_array(Path(args.train_data)))
@@ -745,7 +875,7 @@ async def run_league(args: argparse.Namespace) -> int:
         strict_llm_evolution=bool(args.strict_llm_evolution),
         llm_max_attempts=int(args.llm_max_attempts),
         llm_outer_retries=int(args.llm_outer_retries),
-        concurrency=args.concurrency,
+        evolution_concurrency=int(evolution_concurrency),
     )
 
     scoreboard: Dict[str, HolonLeagueState] = {}
@@ -878,7 +1008,7 @@ async def run_league(args: argparse.Namespace) -> int:
                 llm_max_attempts=int(args.llm_max_attempts),
                 llm_outer_retries=int(args.llm_outer_retries),
                 strict_llm_evolution=bool(args.strict_llm_evolution),
-                concurrency=int(args.concurrency),
+                evolution_concurrency=int(evolution_concurrency),
             )
             for hid, handle in predictors.items():
                 state = scoreboard[hid]
@@ -930,6 +1060,7 @@ async def run_league(args: argparse.Namespace) -> int:
             "llm_outer_retries": int(args.llm_outer_retries),
             "llm_re_evolve_interval": int(args.llm_re_evolve_interval),
             "concurrency": int(args.concurrency),
+            "evolution_concurrency": int(evolution_concurrency),
             "mentor_top_k": int(args.mentor_top_k),
             "mentor_adopt_rate": float(args.mentor_adopt_rate),
             "llm_provider": llm_provider_info,
@@ -993,6 +1124,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--holon-prefix", default="holon_points_predictor")
     parser.add_argument("--skill-name", default=SKILL_NAME)
     parser.add_argument("--concurrency", type=int, default=10)
+    parser.add_argument("--evolution-concurrency", type=int, default=None)
     parser.add_argument("--mentor-top-k", type=int, default=5)
     parser.add_argument("--mentor-adopt-rate", type=float, default=0.65)
     parser.add_argument(
