@@ -355,6 +355,14 @@ class EvolutionService:
                 error_message=red_result["error"],
             )
 
+        red_contract_result = await self._phase_red_contract(tests, holon_id)
+        if not red_contract_result["passed"]:
+            return EvolutionResult(
+                success=False,
+                phase="red",
+                error_message=red_contract_result["error"],
+            )
+
         green_result = await self._phase_green(code, tests, holon_id)
         if not green_result["passed"]:
             return EvolutionResult(
@@ -409,11 +417,18 @@ class EvolutionService:
         requirements: List[str],
         tool_schema: ToolSchema,
         version: str = "0.1.0",
+        max_attempts: Optional[int] = None,
     ) -> EvolutionResult:
-        """End-to-end LLM-driven evolution (no hardcoded templates)."""
+        """End-to-end LLM-driven evolution (no hardcoded templates).
+
+        Runs autonomous RGV with repair retries so Holons can iterate without
+        hand-written scaffolding templates.
+        """
+        configured_attempts = max_attempts if max_attempts is not None else settings.evolution_max_attempts
+        attempts = max(1, int(configured_attempts))
         tests = await self._generate_tests_via_llm(skill_name, description, requirements)
         code = await self._generate_code_via_llm(skill_name, description, requirements, tests)
-        return await self.evolve_skill(
+        result = await self.evolve_skill(
             holon_id=holon_id,
             skill_name=skill_name,
             code=code,
@@ -422,6 +437,32 @@ class EvolutionService:
             tool_schema=tool_schema,
             version=version,
         )
+        if result.success or attempts == 1:
+            return result
+
+        previous_code = code
+        for _attempt in range(2, attempts + 1):
+            previous_code = await self._repair_code_via_llm(
+                skill_name=skill_name,
+                description=description,
+                requirements=requirements,
+                tests=tests,
+                previous_code=previous_code,
+                failure_phase=result.phase,
+                failure_message=result.error_message or "",
+            )
+            result = await self.evolve_skill(
+                holon_id=holon_id,
+                skill_name=skill_name,
+                code=previous_code,
+                tests=tests,
+                description=description,
+                tool_schema=tool_schema,
+                version=version,
+            )
+            if result.success:
+                return result
+        return result
 
     async def evolve_skill_with_test_cases(
         self,
@@ -538,6 +579,30 @@ class EvolutionService:
             return {"passed": True, "error": None}
         except SyntaxError as exc:
             return {"passed": False, "error": f"syntax error: {exc}"}
+
+    async def _phase_red_contract(self, tests: str, holon_id: str) -> Dict[str, Any]:
+        """Ensure tests encode behavior by failing against a baseline stub."""
+        baseline_code = (
+            "def __getattr__(name):\n"
+            "    def _missing(*args, **kwargs):\n"
+            "        raise NotImplementedError(f\"{name} not implemented\")\n"
+            "    return _missing\n"
+        )
+        baseline_result = await self._phase_green(
+            code=baseline_code,
+            tests=tests,
+            holon_id=holon_id,
+        )
+        if baseline_result["passed"]:
+            return {
+                "passed": False,
+                "error": (
+                    "tests must fail against baseline implementation; "
+                    "current tests are too weak to drive Red phase"
+                ),
+                "details": baseline_result.get("details"),
+            }
+        return {"passed": True, "error": None}
 
     async def _phase_green(self, code: str, tests: str, holon_id: str) -> Dict[str, Any]:
         """Run pytest in sandbox."""
@@ -728,6 +793,50 @@ Tests that must pass:
         config = LLMConfig(
             provider_id=settings.llm_provider,
             temperature=0.3,
+            max_tokens=8000,
+        )
+        response = await self._llm.chat(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            config=config,
+        )
+        return self._strip_code_fences(response.content)
+
+    async def _repair_code_via_llm(
+        self,
+        skill_name: str,
+        description: str,
+        requirements: List[str],
+        tests: str,
+        previous_code: str,
+        failure_phase: str,
+        failure_message: str,
+    ) -> str:
+        """Repair generated code from RGV feedback without introducing templates."""
+        req_text = "\n".join(f"- {r}" for r in requirements)
+        system_prompt = (
+            "You are a senior Python engineer. "
+            "You will repair code to pass pytest and security verification. "
+            "Return only the full corrected code."
+        )
+        user_prompt = f"""Skill: {skill_name}
+Description: {description}
+Requirements:
+{req_text}
+
+RGV failure:
+- phase: {failure_phase}
+- message: {failure_message}
+
+Previous code:
+{previous_code}
+
+Tests that must pass:
+{tests}
+"""
+        config = LLMConfig(
+            provider_id=settings.llm_provider,
+            temperature=0.1,
             max_tokens=8000,
         )
         response = await self._llm.chat(

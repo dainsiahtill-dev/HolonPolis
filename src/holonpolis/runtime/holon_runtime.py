@@ -413,6 +413,7 @@ class HolonRuntime:
         from holonpolis.services.evolution_service import EvolutionService
         from holonpolis.genesis.genesis_memory import GenesisMemory
 
+        result: Optional["EvolutionResult"] = None
         try:
             request.status = EvolutionStatus.EVOLVING
             logger.info("evolution_started", request_id=request.request_id)
@@ -453,45 +454,6 @@ class HolonRuntime:
                     tool_schema=tool_schema,
                 )
 
-            if result.success:
-                request.status = EvolutionStatus.COMPLETED
-                request.result = {
-                    "skill_id": result.skill_id,
-                    "attestation_id": result.attestation.attestation_id if result.attestation else None,
-                    "code_path": result.code_path,
-                }
-                self.state.skills.append(result.skill_id)
-
-                await self.remember(
-                    content=f"Successfully evolved skill: {request.skill_name} ({result.skill_id})",
-                    tags=["evolution", "skill_completed"],
-                    importance=1.0,
-                )
-                await genesis_memory.record_evolution(
-                    holon_id=self.holon_id,
-                    skill_name=request.skill_name,
-                    status="success",
-                    attestation_id=result.attestation.attestation_id if result.attestation else None,
-                )
-
-                logger.info(
-                    "evolution_completed",
-                    request_id=request.request_id,
-                    skill_id=result.skill_id,
-                )
-            else:
-                request.status = EvolutionStatus.FAILED
-                request.error_message = result.error_message
-                await genesis_memory.record_evolution(
-                    holon_id=self.holon_id,
-                    skill_name=request.skill_name,
-                    status="failed",
-                    error_message=result.error_message,
-                )
-
-                # Try to learn from failure
-                await self._learn_from_evolution_failure(request, result)
-
         except Exception as e:
             request.status = EvolutionStatus.FAILED
             request.error_message = str(e)
@@ -500,8 +462,109 @@ class HolonRuntime:
                 request_id=request.request_id,
                 error=str(e),
             )
+            request.completed_at = utc_now_iso()
+            return
 
+        if result and result.success:
+            request.status = EvolutionStatus.COMPLETED
+            request.result = {
+                "skill_id": result.skill_id,
+                "attestation_id": result.attestation.attestation_id if result.attestation else None,
+                "code_path": result.code_path,
+            }
+            if result.skill_id:
+                self.state.skills.append(result.skill_id)
+
+            await self._safe_remember(
+                content=f"Successfully evolved skill: {request.skill_name} ({result.skill_id})",
+                tags=["evolution", "skill_completed"],
+                importance=1.0,
+            )
+            await self._safe_record_evolution(
+                genesis_memory=genesis_memory,
+                skill_name=request.skill_name,
+                status="success",
+                attestation_id=result.attestation.attestation_id if result.attestation else None,
+            )
+
+            logger.info(
+                "evolution_completed",
+                request_id=request.request_id,
+                skill_id=result.skill_id,
+            )
+            request.completed_at = utc_now_iso()
+            return
+
+        request.status = EvolutionStatus.FAILED
+        request.error_message = result.error_message if result else "evolution_result_missing"
+        await self._safe_record_evolution(
+            genesis_memory=genesis_memory,
+            skill_name=request.skill_name,
+            status="failed",
+            error_message=request.error_message,
+        )
+        await self._safe_learn_from_evolution_failure(request, result)
         request.completed_at = utc_now_iso()
+
+    async def _safe_record_evolution(
+        self,
+        genesis_memory: Any,
+        skill_name: str,
+        status: str,
+        attestation_id: Optional[str] = None,
+        error_message: Optional[str] = None,
+    ) -> None:
+        """Record evolution audit data without mutating final RGV status on failure."""
+        try:
+            await genesis_memory.record_evolution(
+                holon_id=self.holon_id,
+                skill_name=skill_name,
+                status=status,
+                attestation_id=attestation_id,
+                error_message=error_message,
+            )
+        except Exception as exc:
+            logger.warning(
+                "genesis_evolution_audit_failed",
+                holon_id=self.holon_id,
+                skill_name=skill_name,
+                status=status,
+                error=str(exc),
+            )
+
+    async def _safe_remember(
+        self,
+        content: str,
+        tags: List[str],
+        importance: float,
+    ) -> None:
+        """Best-effort memory write for non-critical telemetry."""
+        try:
+            await self.remember(content=content, tags=tags, importance=importance)
+        except Exception as exc:
+            logger.warning(
+                "evolution_memory_write_failed",
+                holon_id=self.holon_id,
+                error=str(exc),
+            )
+
+    async def _safe_learn_from_evolution_failure(
+        self,
+        request: EvolutionRequest,
+        result: Optional["EvolutionResult"],
+    ) -> None:
+        """Best-effort post-mortem learning for failed evolutions."""
+        if result is None:
+            return
+        try:
+            await self._learn_from_evolution_failure(request, result)
+        except Exception as exc:
+            logger.warning(
+                "evolution_failure_learning_failed",
+                holon_id=self.holon_id,
+                request_id=request.request_id,
+                error=str(exc),
+            )
 
     async def _learn_from_evolution_failure(
         self,
@@ -629,6 +692,38 @@ class HolonRuntime:
     def get_evolution_status(self, request_id: str) -> Optional[EvolutionRequest]:
         """Get status of an evolution request."""
         return self._evolution_requests.get(request_id)
+
+    async def wait_for_evolution(
+        self,
+        request_id: str,
+        timeout_seconds: float = 300.0,
+        poll_interval_seconds: float = 0.5,
+    ) -> EvolutionRequest:
+        """Wait until an evolution request reaches a terminal state."""
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be > 0")
+        if poll_interval_seconds <= 0:
+            raise ValueError("poll_interval_seconds must be > 0")
+
+        deadline = time.monotonic() + timeout_seconds
+        terminal = {
+            EvolutionStatus.COMPLETED,
+            EvolutionStatus.FAILED,
+            EvolutionStatus.REJECTED,
+        }
+
+        while True:
+            status = self.get_evolution_status(request_id)
+            if status is None:
+                raise ValueError(f"Evolution request not found: {request_id}")
+            if status.status in terminal:
+                return status
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Timed out waiting for evolution request {request_id} "
+                    f"after {timeout_seconds:.1f}s"
+                )
+            await asyncio.sleep(poll_interval_seconds)
 
     def list_skills(self) -> List[Dict[str, Any]]:
         """List persisted evolved skills for this Holon."""

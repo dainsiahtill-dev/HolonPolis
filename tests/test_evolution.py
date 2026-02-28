@@ -424,13 +424,14 @@ def dangerous_delete(path):
     os.system(f"rm -rf {path}")
     return True
 '''
-        # 测试只是检查函数存在且能调用（不实际调用危险部分）
+        # 测试验证函数契约，避免在 Red 基线实现下误通过
         tests = '''
 import skill_module
 
-def test_function_exists():
-    assert hasattr(skill_module, 'dangerous_delete')
-    assert callable(skill_module.dangerous_delete)
+def test_function_contract():
+    fn = getattr(skill_module, "dangerous_delete")
+    assert callable(fn)
+    assert fn.__name__ == "dangerous_delete"
 '''
 
         result = await service.evolve_skill(
@@ -474,6 +475,38 @@ def test_add():
         assert result.success is False
         assert result.phase == "green"
 
+    @pytest.mark.asyncio
+    async def test_evolution_fails_when_tests_do_not_define_behavior(
+        self,
+        evolution_setup,
+        service,
+        tool_schema,
+    ):
+        """测试弱测试用例在 Red 语义检查阶段被拒绝."""
+        code = '''
+def execute():
+    return "ok"
+'''
+        tests = '''
+import skill_module
+
+def test_callable_exists_only():
+    assert callable(skill_module.execute)
+'''
+        result = await service.evolve_skill(
+            holon_id="evo_holon_004",
+            skill_name="WeakTestSkill",
+            code=code,
+            tests=tests,
+            description="Should fail at red due to weak tests",
+            tool_schema=tool_schema,
+            version="0.1.0",
+        )
+
+        assert result.success is False
+        assert result.phase == "red"
+        assert "too weak" in (result.error_message or "")
+
 
 class TestEvolutionFromTestCases:
     """给定语义测试用例的演化测试."""
@@ -511,6 +544,63 @@ def execute(a, b):
         assert result.success is True
         assert result.phase == "complete"
         assert result.skill_id == "caseadder"
+
+    @pytest.mark.asyncio
+    async def test_evolve_skill_autonomous_repairs_after_green_failure(
+        self,
+        evolution_setup,
+        tool_schema,
+        monkeypatch,
+    ):
+        service = EvolutionService()
+
+        async def fake_generate_tests(skill_name, description, requirements):
+            return """
+from skill_module import execute
+
+def test_execute():
+    assert execute(2, 3) == 5
+"""
+
+        async def fake_generate_code(skill_name, description, requirements, tests):
+            return """
+def execute(a, b):
+    return a - b
+"""
+
+        async def fake_repair(
+            skill_name,
+            description,
+            requirements,
+            tests,
+            previous_code,
+            failure_phase,
+            failure_message,
+        ):
+            assert failure_phase == "green"
+            assert "pytest failed" in failure_message
+            assert "return a - b" in previous_code
+            return """
+def execute(a, b):
+    return a + b
+"""
+
+        monkeypatch.setattr(service, "_generate_tests_via_llm", fake_generate_tests)
+        monkeypatch.setattr(service, "_generate_code_via_llm", fake_generate_code)
+        monkeypatch.setattr(service, "_repair_code_via_llm", fake_repair)
+
+        result = await service.evolve_skill_autonomous(
+            holon_id="auto_retry_holon",
+            skill_name="AutoRetryAdder",
+            description="Add two numbers reliably",
+            requirements=["Accept numbers a and b", "Return a + b"],
+            tool_schema=tool_schema,
+            max_attempts=2,
+        )
+
+        assert result.success is True
+        assert result.phase == "complete"
+        assert result.skill_id == "autoretryadder"
 
 
 class TestAttestation:

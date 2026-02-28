@@ -140,3 +140,5 @@ services/       # 🧠 Layer 2: 领域服务 (genesis, evolution, memory, holon)
 **关键约束**:
 - 所有运行时数据**必须**在 `.holonpolis/` 内
 - 每个 Holon 拥有**物理隔离**的 `memory/lancedb/`
+- 需求应先走演化主（Genesis）做“路由或孵化”决策，而不是旁路直接造 Holon。
+- 只能由Holon去演化/升级自己的能力（只能运行自己的代码空间以及技能）然后生成目标项目代码，而HolonPolis元项目-绝对不可以包含目标项目的任何业务代码！

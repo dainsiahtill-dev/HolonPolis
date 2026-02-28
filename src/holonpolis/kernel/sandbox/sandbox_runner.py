@@ -350,6 +350,26 @@ class SandboxRunner:
 
         return args
 
+    @staticmethod
+    def _normalize_command_for_platform(command: list[str]) -> list[str]:
+        """Normalize shell-builtin commands for cross-platform execution.
+
+        On Windows, `echo` is a shell builtin, not an executable. Convert it
+        into a Python print command so sandbox execution remains shell-free.
+        """
+        if os.name != "nt" or not command:
+            return command
+
+        if command[0].lower() != "echo":
+            return command
+
+        return [
+            sys.executable,
+            "-c",
+            "import sys; print(' '.join(sys.argv[1:]))",
+            *command[1:],
+        ]
+
     async def run(
         self,
         command: list[str],
@@ -408,7 +428,8 @@ class SandboxRunner:
             )
 
         # 3. 构建执行参数
-        process_args = self._build_process_args(command, work_dir, config)
+        execution_command = self._normalize_command_for_platform(command)
+        process_args = self._build_process_args(execution_command, work_dir, config)
 
         # 4. 异步执行
         proc: Optional[asyncio.subprocess.Process] = None

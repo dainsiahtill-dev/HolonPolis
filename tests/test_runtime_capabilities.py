@@ -3,16 +3,19 @@
 import pytest
 
 from holonpolis.domain import Blueprint, Boundary, EvolutionPolicy
+from holonpolis.genesis.genesis_memory import GenesisMemory
 from holonpolis.domain.skills import ToolSchema
 from holonpolis.kernel.embeddings.default_embedder import SimpleEmbedder, set_embedder
 from holonpolis.kernel.lancedb import reset_factory
 from holonpolis.runtime.holon_runtime import (
     CapabilityDeniedError,
+    EvolutionStatus,
     HolonRuntime,
     SkillPayloadValidationError,
 )
 from holonpolis.services.collaboration_service import CollaborationService
 from holonpolis.services.evolution_service import EvolutionService
+from holonpolis.services.holon_service import HolonService
 from holonpolis.services.market_service import MarketService
 
 
@@ -185,3 +188,49 @@ async def test_runtime_selection_denied_by_boundary_policy(runtime_setup):
     runtime = HolonRuntime(holon_id=holon_id, blueprint=restricted_blueprint)
     with pytest.raises(CapabilityDeniedError):
         await runtime.run_selection(threshold=0.5)
+
+
+@pytest.mark.asyncio
+async def test_runtime_evolution_status_survives_genesis_audit_failure(runtime_setup, monkeypatch):
+    """Evolution should remain completed even if Genesis audit persistence fails."""
+    holon_id = "runtime_evo_resilience"
+    blueprint = _blueprint(holon_id)
+    await HolonService().create_holon(blueprint)
+    runtime = HolonRuntime(holon_id=holon_id, blueprint=blueprint)
+
+    async def fake_generate_tests(self, skill_name, description, requirements):
+        return """
+from skill_module import execute
+
+def test_execute():
+    assert execute(2, 3) == 5
+"""
+
+    async def fake_generate_code(self, skill_name, description, requirements, tests):
+        return """
+def execute(a, b):
+    return a + b
+"""
+
+    async def fake_record_evolution(self, *args, **kwargs):
+        raise RuntimeError("genesis evolutions table unavailable")
+
+    monkeypatch.setattr(EvolutionService, "_generate_tests_via_llm", fake_generate_tests)
+    monkeypatch.setattr(EvolutionService, "_generate_code_via_llm", fake_generate_code)
+    monkeypatch.setattr(GenesisMemory, "record_evolution", fake_record_evolution)
+
+    request = await runtime.request_evolution(
+        skill_name="ResilientAdder",
+        description="Add two numbers",
+        requirements=["Expose execute(a, b)", "Return a + b"],
+    )
+    status = await runtime.wait_for_evolution(
+        request_id=request.request_id,
+        timeout_seconds=20,
+        poll_interval_seconds=0.1,
+    )
+
+    assert status.status == EvolutionStatus.COMPLETED
+    assert status.result is not None
+    assert status.result["skill_id"] == "resilientadder"
+    assert await runtime.execute_skill("resilientadder", a=9, b=4) == 13

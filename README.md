@@ -221,6 +221,33 @@ pytest tests/test_genesis_routing.py -v
 pytest tests/test_evolution_red_green.py -v
 ```
 
+### 自治项目孵化（无业务模板）
+
+通过 Genesis 路由/孵化目标 Holon，再由该 Holon 自主演化项目生成技能：
+
+```bash
+python scripts/incubate_autonomous_game_project.py \
+  --project-name "Snake Arena" \
+  --project-goal "构建一个浏览器贪吃蛇项目，支持键盘控制、碰撞检测、分数与重开流程" \
+  --required-file README.md \
+  --required-file package.json
+```
+
+或：
+
+```bash
+python scripts/incubate_autonomous_game_project.py \
+  --project-name "Abyss Arena" \
+  --project-goal "构建一个网页大鱼吃小鱼项目，包含 websocket 服务端与浏览器客户端的实时状态同步" \
+  --required-file README.md \
+  --required-file package.json
+```
+
+说明：
+- 元项目只提供演化编排与安全约束，不内置任何具体业务项目模板代码。
+- 业务代码由被路由/孵化出的目标 Holon 在 RGV 流程中自主演化生成。
+- 产物落盘在 `.holonpolis/holons/<holon_id>/workspace/incubations/`。
+
 ---
 
 ## 📡 API 端点
