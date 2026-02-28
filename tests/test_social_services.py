@@ -81,3 +81,19 @@ def test_social_state_snapshot_compaction(social_setup):
             "SELECT COUNT(*) FROM social_state_snapshots WHERE scope = 'market'"
         ).fetchone()[0]
     assert count <= 100
+
+
+def test_selection_result_is_json_safe(social_setup, monkeypatch):
+    """Selection output should keep reputation as plain dict, not dataclass object."""
+    service = MarketService()
+    monkeypatch.setattr(
+        service.holon_service,
+        "list_holons",
+        lambda: [{"holon_id": "holon_sel", "name": "sel", "species_id": "generalist", "purpose": "test"}],
+    )
+
+    result = service.run_selection(threshold=0.0)
+    assert result["survivors"] >= 1
+    top = result["top_performers"][0]
+    assert isinstance(top["reputation"], dict)
+    assert "overall_score" in top["reputation"]

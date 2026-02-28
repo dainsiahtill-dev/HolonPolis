@@ -6,7 +6,11 @@ from holonpolis.domain import Blueprint, Boundary, EvolutionPolicy
 from holonpolis.domain.skills import ToolSchema
 from holonpolis.kernel.embeddings.default_embedder import SimpleEmbedder, set_embedder
 from holonpolis.kernel.lancedb import reset_factory
-from holonpolis.runtime.holon_runtime import HolonRuntime
+from holonpolis.runtime.holon_runtime import (
+    CapabilityDeniedError,
+    HolonRuntime,
+    SkillPayloadValidationError,
+)
 from holonpolis.services.collaboration_service import CollaborationService
 from holonpolis.services.evolution_service import EvolutionService
 from holonpolis.services.market_service import MarketService
@@ -117,3 +121,67 @@ async def test_runtime_social_relationship_wrappers(runtime_setup, monkeypatch):
     service = CollaborationService()
     rels = service.social_graph.get_relationships("social_holon_a")
     assert any(rel.relationship_id == relationship_id for rel in rels)
+
+
+@pytest.mark.asyncio
+async def test_runtime_execute_skill_enforces_schema(runtime_setup):
+    """execute_skill should strictly validate payload against tool schema."""
+    holon_id = "runtime_schema_holon"
+    service = EvolutionService()
+    schema = ToolSchema(
+        name="execute",
+        description="Multiply two numbers",
+        parameters={
+            "type": "object",
+            "properties": {
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+            },
+            "additionalProperties": False,
+        },
+        required=["x", "y"],
+    )
+
+    await service._phase_persist(
+        holon_id=holon_id,
+        skill_name="Multiplier Skill",
+        code="""
+def execute(x, y):
+    return x * y
+""",
+        tests="""
+from skill_module import execute
+
+def test_execute():
+    assert execute(3, 4) == 12
+""",
+        description="Simple multiplier",
+        tool_schema=schema,
+        version="0.1.0",
+        green_result={"passed": True, "details": {"exit_code": 0}},
+        verify_result={"passed": True, "violations": []},
+    )
+
+    runtime = HolonRuntime(holon_id=holon_id, blueprint=_blueprint(holon_id))
+
+    with pytest.raises(SkillPayloadValidationError):
+        await runtime.execute_skill("multiplier_skill", payload={"x": 2, "extra": 1})
+
+
+@pytest.mark.asyncio
+async def test_runtime_selection_denied_by_boundary_policy(runtime_setup):
+    """High-impact operations should be blocked by boundary capability mapping."""
+    holon_id = "runtime_policy_holon"
+    restricted_blueprint = Blueprint(
+        blueprint_id=f"bp_{holon_id}",
+        holon_id=holon_id,
+        species_id="generalist",
+        name="Restricted Runtime",
+        purpose="Policy test",
+        boundary=Boundary(allowed_tools=["market.read"], denied_tools=[]),
+        evolution_policy=EvolutionPolicy(),
+    )
+
+    runtime = HolonRuntime(holon_id=holon_id, blueprint=restricted_blueprint)
+    with pytest.raises(CapabilityDeniedError):
+        await runtime.run_selection(threshold=0.5)

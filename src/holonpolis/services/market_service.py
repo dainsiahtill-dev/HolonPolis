@@ -494,7 +494,17 @@ class MarketService:
                 survivors.append({
                     "holon_id": holon_id,
                     "score": survival_score,
-                    "reputation": reputation,
+                    "reputation": {
+                        "overall_score": reputation.overall_score,
+                        "reliability": reputation.reliability,
+                        "competence": reputation.competence,
+                        "collaboration": reputation.collaboration,
+                        "innovation": reputation.innovation,
+                        "total_tasks": reputation.total_tasks,
+                        "successful_tasks": reputation.successful_tasks,
+                        "failed_tasks": reputation.failed_tasks,
+                        "collaboration_count": reputation.collaboration_count,
+                    },
                 })
             else:
                 eliminated.append({

@@ -217,6 +217,29 @@ indirect_trust = social_graph.propagate_trust(
 3. **自然选择**: 优胜劣汰，适者生存
 4. **涌现智能**: 系统智能来自个体交互，而非预设
 
+## 🔐 边界能力映射 (Boundary Capability Mapping)
+
+高影响操作受 Blueprint `boundary.allowed_tools/denied_tools` 控制。  
+推荐使用能力标识（支持精确匹配和 `*` 前缀匹配）：
+
+- `skill.execute`: 执行已演化技能
+- `evolution.request`: 发起技能演化
+- `social.selection.execute`: 执行自然选择
+- `social.competition.execute`: 发起竞争评估
+
+示例：
+
+```json
+{
+  "boundary": {
+    "allowed_tools": ["social.*", "skill.execute"],
+    "denied_tools": ["social.selection.execute"]
+  }
+}
+```
+
+上例表示允许大部分社会能力，但显式禁止选择淘汰操作。
+
 ## 🚀 使用示例
 
 ```python

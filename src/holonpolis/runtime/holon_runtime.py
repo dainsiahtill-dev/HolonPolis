@@ -14,6 +14,7 @@ import asyncio
 import importlib.util
 import inspect
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -106,6 +107,14 @@ class LoadedSkill:
             params.update(payload)
         params.update(kwargs)
         return await self._executor(params)
+
+
+class CapabilityDeniedError(PermissionError):
+    """Raised when a runtime capability is blocked by boundary policy."""
+
+
+class SkillPayloadValidationError(ValueError):
+    """Raised when input payload does not satisfy skill tool schema."""
 
 
 class HolonRuntime:
@@ -680,8 +689,195 @@ class HolonRuntime:
         **kwargs: Any,
     ) -> Any:
         """Convenience wrapper to execute a persisted evolved skill."""
+        self.enforce_capability("skill.execute", aliases=["execute"])
         skill = self.get_skill(skill_name_or_id)
-        return await skill.execute(payload=payload, **kwargs)
+        merged_payload: Dict[str, Any] = {}
+        if payload is not None:
+            if not isinstance(payload, dict):
+                raise SkillPayloadValidationError("payload must be an object/dict")
+            merged_payload.update(payload)
+        merged_payload.update(kwargs)
+        self._validate_payload_against_tool_schema(merged_payload, skill.tool_schema)
+        return await skill.execute(payload=merged_payload)
+
+    def _validate_payload_against_tool_schema(
+        self,
+        payload: Dict[str, Any],
+        tool_schema: Dict[str, Any],
+    ) -> None:
+        """Strictly validate payload against manifest tool schema."""
+        if not isinstance(payload, dict):
+            raise SkillPayloadValidationError("payload must be an object/dict")
+        if not isinstance(tool_schema, dict):
+            return
+
+        parameters = tool_schema.get("parameters", {})
+        if not isinstance(parameters, dict):
+            return
+
+        root_schema: Dict[str, Any] = dict(parameters)
+        if "type" not in root_schema and (
+            "properties" in root_schema or "required" in root_schema
+        ):
+            root_schema["type"] = "object"
+
+        manifest_required = tool_schema.get("required", [])
+        if isinstance(manifest_required, list) and manifest_required and "required" not in root_schema:
+            root_schema["required"] = manifest_required
+
+        self._validate_json_schema_value(
+            value=payload,
+            schema=root_schema,
+            path="payload",
+            strict_object_default=True,
+        )
+
+    def _validate_json_schema_value(
+        self,
+        value: Any,
+        schema: Dict[str, Any],
+        path: str,
+        strict_object_default: bool,
+    ) -> None:
+        expected_type = schema.get("type")
+        if expected_type is not None:
+            allowed_types = (
+                expected_type if isinstance(expected_type, list) else [expected_type]
+            )
+            if not any(self._value_matches_type(value, t) for t in allowed_types):
+                expected = " | ".join(str(t) for t in allowed_types)
+                actual = self._infer_json_type(value)
+                raise SkillPayloadValidationError(
+                    f"{path} expected type {expected}, got {actual}"
+                )
+
+        if "enum" in schema and value not in schema["enum"]:
+            raise SkillPayloadValidationError(
+                f"{path} must be one of {schema['enum']}, got {value!r}"
+            )
+        if "const" in schema and value != schema["const"]:
+            raise SkillPayloadValidationError(
+                f"{path} must equal {schema['const']!r}, got {value!r}"
+            )
+
+        if isinstance(value, str):
+            min_length = schema.get("minLength")
+            max_length = schema.get("maxLength")
+            pattern = schema.get("pattern")
+            if isinstance(min_length, int) and len(value) < min_length:
+                raise SkillPayloadValidationError(f"{path} length must be >= {min_length}")
+            if isinstance(max_length, int) and len(value) > max_length:
+                raise SkillPayloadValidationError(f"{path} length must be <= {max_length}")
+            if isinstance(pattern, str) and re.search(pattern, value) is None:
+                raise SkillPayloadValidationError(f"{path} does not match pattern {pattern!r}")
+
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            minimum = schema.get("minimum")
+            maximum = schema.get("maximum")
+            exclusive_min = schema.get("exclusiveMinimum")
+            exclusive_max = schema.get("exclusiveMaximum")
+            if minimum is not None and value < minimum:
+                raise SkillPayloadValidationError(f"{path} must be >= {minimum}")
+            if maximum is not None and value > maximum:
+                raise SkillPayloadValidationError(f"{path} must be <= {maximum}")
+            if exclusive_min is not None and value <= exclusive_min:
+                raise SkillPayloadValidationError(f"{path} must be > {exclusive_min}")
+            if exclusive_max is not None and value >= exclusive_max:
+                raise SkillPayloadValidationError(f"{path} must be < {exclusive_max}")
+
+        if isinstance(value, list):
+            min_items = schema.get("minItems")
+            max_items = schema.get("maxItems")
+            if isinstance(min_items, int) and len(value) < min_items:
+                raise SkillPayloadValidationError(f"{path} must contain at least {min_items} items")
+            if isinstance(max_items, int) and len(value) > max_items:
+                raise SkillPayloadValidationError(f"{path} must contain at most {max_items} items")
+            item_schema = schema.get("items")
+            if isinstance(item_schema, dict):
+                for index, item in enumerate(value):
+                    self._validate_json_schema_value(
+                        value=item,
+                        schema=item_schema,
+                        path=f"{path}[{index}]",
+                        strict_object_default=strict_object_default,
+                    )
+
+        if isinstance(value, dict):
+            required = schema.get("required", [])
+            if isinstance(required, list):
+                missing = [key for key in required if key not in value]
+                if missing:
+                    raise SkillPayloadValidationError(
+                        f"{path} missing required fields: {', '.join(missing)}"
+                    )
+
+            properties = schema.get("properties", {})
+            if not isinstance(properties, dict):
+                properties = {}
+
+            additional = schema.get("additionalProperties", None)
+            additional_schema = additional if isinstance(additional, dict) else None
+            if isinstance(additional, bool):
+                additional_allowed = additional
+            elif additional is None:
+                additional_allowed = False if (strict_object_default and properties) else True
+            else:
+                additional_allowed = True
+
+            for key, item in value.items():
+                child_path = f"{path}.{key}"
+                if key in properties and isinstance(properties[key], dict):
+                    self._validate_json_schema_value(
+                        value=item,
+                        schema=properties[key],
+                        path=child_path,
+                        strict_object_default=strict_object_default,
+                    )
+                elif additional_schema is not None:
+                    self._validate_json_schema_value(
+                        value=item,
+                        schema=additional_schema,
+                        path=child_path,
+                        strict_object_default=strict_object_default,
+                    )
+                elif not additional_allowed:
+                    raise SkillPayloadValidationError(f"{path} contains unexpected field: {key}")
+
+    @staticmethod
+    def _value_matches_type(value: Any, schema_type: Any) -> bool:
+        if schema_type == "string":
+            return isinstance(value, str)
+        if schema_type == "number":
+            return isinstance(value, (int, float)) and not isinstance(value, bool)
+        if schema_type == "integer":
+            return isinstance(value, int) and not isinstance(value, bool)
+        if schema_type == "boolean":
+            return isinstance(value, bool)
+        if schema_type == "object":
+            return isinstance(value, dict)
+        if schema_type == "array":
+            return isinstance(value, list)
+        if schema_type == "null":
+            return value is None
+        return True
+
+    @staticmethod
+    def _infer_json_type(value: Any) -> str:
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "boolean"
+        if isinstance(value, int):
+            return "integer"
+        if isinstance(value, float):
+            return "number"
+        if isinstance(value, str):
+            return "string"
+        if isinstance(value, dict):
+            return "object"
+        if isinstance(value, list):
+            return "array"
+        return type(value).__name__
 
     def _iter_skill_roots(self) -> List[Path]:
         guard = HolonPathGuard(self.holon_id)
@@ -960,6 +1156,55 @@ class HolonRuntime:
             tools.update(exec_tool_names())
         return sorted(tools)
 
+    @staticmethod
+    def _capability_matches_pattern(capability: str, pattern: str) -> bool:
+        cap = capability.strip().lower()
+        pat = pattern.strip().lower()
+        if not pat:
+            return False
+        if pat == "*":
+            return True
+        if pat.endswith("*"):
+            return cap.startswith(pat[:-1])
+        return cap == pat
+
+    def is_capability_allowed(self, capability: str, aliases: Optional[List[str]] = None) -> bool:
+        """Check if a high-level runtime capability is allowed by blueprint boundary."""
+        tokens = [capability]
+        if aliases:
+            tokens.extend(aliases)
+        normalized = [t.strip().lower() for t in tokens if t and t.strip()]
+        if not normalized:
+            return True
+
+        denied = [str(t).strip().lower() for t in self.blueprint.boundary.denied_tools if str(t).strip()]
+        for token in normalized:
+            if any(self._capability_matches_pattern(token, pattern) for pattern in denied):
+                return False
+
+        allowed = [str(t).strip().lower() for t in self.blueprint.boundary.allowed_tools if str(t).strip()]
+        if not allowed:
+            return True
+
+        return any(
+            self._capability_matches_pattern(token, pattern)
+            for token in normalized
+            for pattern in allowed
+        )
+
+    def enforce_capability(self, capability: str, aliases: Optional[List[str]] = None) -> None:
+        """Raise when capability is denied by boundary policy."""
+        if self.is_capability_allowed(capability, aliases=aliases):
+            return
+
+        requested = [capability] + (aliases or [])
+        raise CapabilityDeniedError(
+            "Capability denied by boundary policy. "
+            f"Requested any of: {requested}; "
+            f"allowed={self.blueprint.boundary.allowed_tools}; "
+            f"denied={self.blueprint.boundary.denied_tools}"
+        )
+
     def get_stats(self) -> Dict[str, Any]:
         """Get runtime statistics."""
         return {
@@ -975,6 +1220,10 @@ class HolonRuntime:
 
     async def run_selection(self, threshold: float = 0.3) -> Dict[str, Any]:
         """Execute market selection and return ecosystem survival stats."""
+        self.enforce_capability(
+            "social.selection.execute",
+            aliases=["selection", "execute"],
+        )
         from holonpolis.services.market_service import MarketService
 
         market = MarketService()
@@ -1204,6 +1453,10 @@ class HolonRuntime:
         Returns:
             竞争结果
         """
+        self.enforce_capability(
+            "social.competition.execute",
+            aliases=["competition", "execute"],
+        )
         from holonpolis.services.market_service import MarketService
 
         market = MarketService()
