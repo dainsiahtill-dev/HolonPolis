@@ -104,7 +104,7 @@ class Settings(BaseSettings):
     memory_importance_threshold: float = 0.5
 
     # Evolution configuration
-    evolution_max_attempts: int = 3
+    evolution_max_attempts: int = 5
     evolution_pytest_timeout: int = 30
 
     def _resolve_under_root(self, value: Path) -> Path:

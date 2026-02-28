@@ -194,3 +194,14 @@ async def test_incubation_blocks_path_traversal_from_generated_files(incubation_
                 project_goal="Build a multiplayer fish game with websocket synchronization.",
             )
         )
+
+
+def test_build_requirements_adds_large_multiplayer_floor():
+    service = ProjectIncubationService()
+    requirements = service._build_requirements(
+        "构建大型多人在线 MMO WebSocket 游戏，要求实时同步。",
+        [],
+    )
+    assert any("at least 18 files" in item for item in requirements)
+    assert any("Fish-eat-fish gameplay floor" in item for item in requirements)
+    assert any("placeholder" in item.lower() for item in requirements)

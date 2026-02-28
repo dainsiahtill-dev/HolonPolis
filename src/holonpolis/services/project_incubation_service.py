@@ -190,6 +190,7 @@ class ProjectIncubationService:
         )
 
     def _build_requirements(self, project_goal: str, required_files: List[str]) -> List[str]:
+        is_large_multiplayer = self._is_large_multiplayer_goal(project_goal)
         requirements = [
             "Implement a public execute(...) callable as the entrypoint.",
             "execute(...) must return a dict with keys: project_name, project_slug, files, run_instructions.",
@@ -197,8 +198,26 @@ class ProjectIncubationService:
             "Generated output must be deterministic for the same input.",
             "Do not use placeholders like TODO/TBD or empty files.",
             "README must include install, run, and usage instructions.",
+            "For Node.js projects, all imported third-party runtime packages must be declared in package.json dependencies/devDependencies.",
+            "If a websocket server is generated, it must expose /healthz and /ws and use PORT from environment.",
+            "WebSocket server protocol must emit JSON messages with a type field (at least welcome and snapshot/state semantics).",
+            "When embedding JS/JSON content in Python code generation, avoid multiline Python f-strings; use plain triple-quoted strings to prevent brace interpolation bugs.",
             f"Project goal: {project_goal}",
         ]
+        if is_large_multiplayer:
+            requirements.append(
+                "Large multiplayer project floor: generate at least 18 files across modular directories "
+                "(for example apps/server, apps/client, shared or packages/shared, configs, docs). "
+                "Must include world simulation, matchmaking, and anti-cheat modules in source code paths."
+            )
+            requirements.append(
+                "Fish-eat-fish gameplay floor: generated code must include fish entities, movement updates, "
+                "collision detection, devour/eat mechanics, and growth progression (mass/size/score)."
+            )
+            requirements.append(
+                "Reject placeholder content in generated files (for example: TODO, TBD, placeholder, "
+                "render logic, implement this, coming soon, mock data)."
+            )
         if required_files:
             requirements.append(
                 "Required output file paths: " + ", ".join(required_files)
@@ -214,6 +233,9 @@ class ProjectIncubationService:
         payload: Dict[str, Any] = {
             "project_name": project_name,
             "project_goal": project_goal,
+            # Common aliases to tolerate evolved skill signatures.
+            "project_description": project_goal,
+            "description": project_goal,
         }
         if isinstance(extra_payload, dict):
             payload.update(extra_payload)
@@ -350,3 +372,16 @@ class ProjectIncubationService:
         slug = re.sub(r"[^a-zA-Z0-9]+", "_", str(text or "").strip().lower()).strip("_")
         return slug or "project"
 
+    def _is_large_multiplayer_goal(self, project_goal: str) -> bool:
+        lowered = str(project_goal or "").lower()
+        keywords = (
+            "mmo",
+            "multiplayer",
+            "websocket",
+            "real-time",
+            "large",
+            "large-scale",
+            "多人在线",
+            "大型",
+        )
+        return any(keyword in lowered for keyword in keywords)

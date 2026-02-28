@@ -602,6 +602,158 @@ def execute(a, b):
         assert result.phase == "complete"
         assert result.skill_id == "autoretryadder"
 
+    @pytest.mark.asyncio
+    async def test_evolve_skill_autonomous_repairs_invalid_tests_before_code_generation(
+        self,
+        evolution_setup,
+        tool_schema,
+        monkeypatch,
+    ):
+        service = EvolutionService()
+        call_state = {"tests_generated": 0, "tests_repaired": 0}
+
+        async def fake_generate_tests(skill_name, description, requirements):
+            call_state["tests_generated"] += 1
+            return """
+def execute(a, b):
+    return a + b
+
+def test_weak():
+    assert execute(2, 3) == 5
+"""
+
+        async def fake_repair_tests(
+            skill_name,
+            description,
+            requirements,
+            previous_tests,
+            failure_message,
+        ):
+            call_state["tests_repaired"] += 1
+            assert "import from skill_module" in failure_message
+            return """
+from skill_module import execute
+
+def test_execute():
+    assert execute(2, 3) == 5
+"""
+
+        async def fake_generate_code(skill_name, description, requirements, tests):
+            assert "from skill_module import execute" in tests
+            return """
+def execute(a, b):
+    return a + b
+"""
+
+        monkeypatch.setattr(service, "_generate_tests_via_llm", fake_generate_tests)
+        monkeypatch.setattr(service, "_repair_tests_via_llm", fake_repair_tests)
+        monkeypatch.setattr(service, "_generate_code_via_llm", fake_generate_code)
+
+        result = await service.evolve_skill_autonomous(
+            holon_id="auto_fix_tests_holon",
+            skill_name="AutoFixTestsAdder",
+            description="Add two numbers with valid tests",
+            requirements=["Accept numbers a and b", "Return a + b"],
+            tool_schema=tool_schema,
+            max_attempts=2,
+        )
+
+        assert result.success is True
+        assert result.phase == "complete"
+        assert call_state["tests_generated"] == 1
+        assert call_state["tests_repaired"] == 1
+
+
+class TestProjectContractTests:
+    """项目契约测试模板保障."""
+
+    def test_project_contract_template_includes_runtime_guards(self):
+        requirements = [
+            "execute(...) must return a dict with keys: project_name, project_slug, files, run_instructions.",
+            "files must be Dict[str, str] mapping relative file paths to UTF-8 text content.",
+            "Required output file paths: README.md, package.json",
+        ]
+
+        template = EvolutionService._build_project_contract_tests(requirements)
+
+        assert "test_server_third_party_imports_declared_in_package" in template
+        assert 'assert "ws" in dependencies or "ws" in dev_dependencies' in template
+        assert 'assert "process.env.port" in server' in template
+        assert 'assert "/ws" in server' in template
+        assert 'assert "process.env.port" in smoke' in template
+        assert "assert \".on('/healthz'\" not in server" in template
+        assert "MIN_FILE_COUNT" in template
+        assert "test_skill_source_avoids_multiline_fstring_templates" in template
+        assert "test_execute_signature_contract" in template
+        assert "test_skill_source_avoids_format_template_brace_risk" in template
+        assert "test_no_placeholder_tokens" in template
+        assert "test_domain_modules_present_for_large_game" in template
+        assert "test_fish_gameplay_semantics_present" in template
+        assert "test_gameplay_modules_have_substantive_logic" in template
+
+    def test_project_contract_template_passes_contract_validation(self):
+        requirements = [
+            "execute(...) must return a dict with keys: project_name, project_slug, files, run_instructions.",
+            "files must be Dict[str, str] mapping relative file paths to UTF-8 text content.",
+            "Required output file paths: README.md, package.json",
+        ]
+
+        template = EvolutionService._build_project_contract_tests(requirements)
+        validation = EvolutionService._validate_generated_tests_contract(
+            template,
+            requirements=requirements,
+        )
+        assert validation["passed"] is True
+
+    def test_project_min_file_count_infers_large_project_floor(self):
+        requirements = [
+            "Project goal: 构建大型多人在线 WebSocket MMO",
+            "files must be Dict[str, str] mapping relative file paths to UTF-8 text content.",
+        ]
+        assert EvolutionService._infer_project_min_file_count(requirements) >= 12
+
+    def test_project_generation_rules_include_runtime_constraints(self):
+        requirements = [
+            "execute(...) must return a dict with keys: project_name, project_slug, files, run_instructions.",
+            "files must be Dict[str, str] mapping relative file paths to UTF-8 text content.",
+            "Project goal: Build large multiplayer MMO game with websocket runtime.",
+        ]
+        rules = EvolutionService._project_generation_rules(requirements)
+        merged = "\n".join(rules).lower()
+        assert "at least" in merged and "files" in merged
+        assert "/healthz" in merged and "/ws" in merged
+        assert "new websocketserver" in merged or "new server" in merged
+        assert "process.exit(0)" in merged
+
+    def test_failure_repair_hints_cover_common_project_failures(self):
+        requirements = [
+            "execute(...) must return a dict with keys: project_name, project_slug, files, run_instructions.",
+            "files must be Dict[str, str] mapping relative file paths to UTF-8 text content.",
+            "Project goal: Build large multiplayer MMO game with websocket runtime.",
+        ]
+        failure_message = """
+pytest failed
+test_skill.py::test_no_placeholder_tokens FAILED
+AssertionError: placeholder token in apps/client/src/render.js: render logic
+test_skill.py::test_file_count_meets_scale_floor FAILED
+assert len(files) >= 18
+test_skill.py::test_server_contains_health_and_ws_reply_logic FAILED
+assert '/ws' in server
+test_skill.py::test_ws_smoke_has_timeout_and_failure_exit FAILED
+assert "process.exit(0)" in smoke_raw
+E   KeyError: '\\n  "name"'
+"""
+        hints = EvolutionService._derive_failure_repair_hints(
+            failure_message=failure_message,
+            requirements=requirements,
+        )
+        merged = "\n".join(hints).lower()
+        assert "placeholder" in merged
+        assert "at least 18" in merged
+        assert "/ws" in merged
+        assert "process.exit(0)" in merged
+        assert ".format" in merged or "f-string" in merged
+
 
 class TestAttestation:
     """Attestation 测试."""
