@@ -10,12 +10,12 @@ Sniper Mode: 通过精确检索最大化上下文质量，最小化 token 消耗
 import json
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import structlog
 
 from holonpolis.domain.memory import Episode, MemoryKind, MemoryRecord, RetrievalQuery
+from holonpolis.infrastructure.time_utils import utc_now, utc_now_iso
 from holonpolis.kernel.embeddings.default_embedder import get_embedder
 from holonpolis.kernel.lancedb.lancedb_factory import get_lancedb_factory
 
@@ -233,7 +233,7 @@ class MemoryService:
         table = conn.get_table("episodes")
 
         episode_id = f"ep_{uuid.uuid4().hex[:12]}"
-        now = datetime.utcnow().isoformat()
+        now = utc_now_iso()
 
         episode = Episode(
             episode_id=episode_id,
@@ -505,7 +505,7 @@ class MemoryService:
         # Sniper Mode 重排序算法
         # 综合因素: hybrid_score, importance, success_score, recency
         scored_candidates = []
-        now = datetime.utcnow()
+        now = utc_now()
 
         for c in candidates:
             # 基础分数: hybrid search 结果

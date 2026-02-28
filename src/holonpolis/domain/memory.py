@@ -1,9 +1,10 @@
 """Memory models - episodes and retrievable memories."""
 
 from dataclasses import dataclass, field
-from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
+
+from holonpolis.infrastructure.time_utils import utc_now_iso
 
 
 class MemoryKind(Enum):
@@ -42,7 +43,7 @@ class MemoryRecord:
     source_skill: Optional[str] = None
 
     # Temporal
-    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = field(default_factory=utc_now_iso)
     last_accessed_at: Optional[str] = None
     access_count: int = 0
 
@@ -99,7 +100,7 @@ class Episode:
     evolution_id: Optional[str] = None  # If this episode spawned evolution
 
     # Temporal
-    started_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    started_at: str = field(default_factory=utc_now_iso)
     ended_at: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:

@@ -1,10 +1,11 @@
 """Event envelope structure for all internal communication."""
 
 from dataclasses import dataclass, field
-from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, Optional
 import json
+
+from holonpolis.infrastructure.time_utils import utc_now_iso
 
 
 class EventType(Enum):
@@ -44,7 +45,7 @@ class Event:
 
     type: EventType
     payload: Dict[str, Any]
-    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    timestamp: str = field(default_factory=utc_now_iso)
     source: str = "system"  # Component that emitted the event
 
 

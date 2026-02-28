@@ -1,9 +1,12 @@
 """Social layer service tests."""
 
+import sqlite3
+
 import pytest
 
 from holonpolis.services.collaboration_service import CollaborationService
 from holonpolis.services.market_service import MarketService
+from holonpolis.services.social_state_store import SocialStateStore
 
 
 @pytest.fixture
@@ -30,7 +33,8 @@ def test_market_service_state_shared_across_instances(social_setup):
 
     service_b = MarketService()
     assert offer.offer_id in service_b.offers
-    assert (social_setup / "genesis" / "social_state" / "market_state.json").exists()
+    db_path = social_setup / "genesis" / "social_state" / "state.db"
+    assert db_path.exists()
 
     # Simulate process restart by clearing in-memory cache and reloading.
     MarketService.reset_in_memory_cache()
@@ -57,9 +61,23 @@ async def test_collaboration_state_shared_across_instances(social_setup):
 
     service_b = CollaborationService()
     assert task.task_id in service_b.active_collaborations
-    assert (social_setup / "genesis" / "social_state" / "collaboration_state.json").exists()
+    db_path = social_setup / "genesis" / "social_state" / "state.db"
+    assert db_path.exists()
 
     # Simulate process restart by clearing in-memory cache and reloading.
     CollaborationService.reset_in_memory_cache()
     service_c = CollaborationService()
     assert task.task_id in service_c.active_collaborations
+
+
+def test_social_state_snapshot_compaction(social_setup):
+    """Only latest snapshots should be retained per scope."""
+    store = SocialStateStore()
+    for i in range(130):
+        store.save_market_state({"i": i})
+
+    with sqlite3.connect(store.db_path) as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM social_state_snapshots WHERE scope = 'market'"
+        ).fetchone()[0]
+    assert count <= 100

@@ -12,6 +12,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set
 
+from holonpolis.infrastructure.time_utils import utc_now, utc_now_iso
+
 
 class EvidenceType(Enum):
     """Types of evidence that can be collected."""
@@ -63,7 +65,7 @@ class ToolEvidence:
     stdout: str = ""
     stderr: str = ""
     duration_ms: int = 0
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=utc_now)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -327,7 +329,7 @@ class EvidenceCollector:
         """Record an audit trail entry."""
         entry_with_timestamp = {
             **entry,
-            "recorded_at": datetime.utcnow().isoformat(),
+            "recorded_at": utc_now_iso(),
         }
         self._package.audit_entries.append(entry_with_timestamp)
         self._collected_types.add(EvidenceType.AUDIT_TRAIL)

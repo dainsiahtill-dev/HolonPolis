@@ -11,12 +11,15 @@ Self-Evolution Capabilities:
 """
 
 import asyncio
+import importlib.util
+import inspect
 import json
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from pathlib import Path
+from types import ModuleType
+from typing import Any, Awaitable, Callable, Dict, List, Optional, TYPE_CHECKING
 from enum import Enum
 
 if TYPE_CHECKING:
@@ -27,7 +30,10 @@ import structlog
 from holonpolis.config import settings
 from holonpolis.domain import Blueprint
 from holonpolis.domain.memory import MemoryKind
+from holonpolis.domain.skills import SkillManifest
+from holonpolis.infrastructure.time_utils import utc_now_iso
 from holonpolis.kernel.llm.llm_runtime import LLMConfig, LLMMessage, get_llm_runtime
+from holonpolis.kernel.storage import HolonPathGuard
 from holonpolis.kernel.tools import (
     ToolExecutor,
     ToolChainStep,
@@ -79,6 +85,27 @@ class HolonState:
     skills: List[str] = field(default_factory=list)  # IDs of evolved skills
     evolution_requests: List[str] = field(default_factory=list)
     performance_metrics: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class LoadedSkill:
+    """Callable handle for an evolved skill."""
+
+    skill_id: str
+    name: str
+    description: str
+    version: str
+    tool_schema: Dict[str, Any]
+    _executor: Callable[[Dict[str, Any]], Awaitable[Any]] = field(repr=False)
+
+    async def execute(self, payload: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Any:
+        params: Dict[str, Any] = {}
+        if payload is not None:
+            if not isinstance(payload, dict):
+                raise TypeError("payload must be a dict when provided")
+            params.update(payload)
+        params.update(kwargs)
+        return await self._executor(params)
 
 
 class HolonRuntime:
@@ -335,8 +362,6 @@ class HolonRuntime:
         Returns:
             EvolutionRequest with status and result
         """
-        from holonpolis.services.evolution_service import EvolutionService
-
         request_id = f"evo_{uuid.uuid4().hex[:12]}"
 
         logger.info(
@@ -356,7 +381,7 @@ class HolonRuntime:
             test_cases=test_cases or [],
             parent_skills=parent_skills or [],
             status=EvolutionStatus.PENDING,
-            created_at=datetime.utcnow().isoformat(),
+            created_at=utc_now_iso(),
         )
 
         # Store request
@@ -375,9 +400,8 @@ class HolonRuntime:
 
     async def _execute_evolution(self, request: EvolutionRequest) -> None:
         """Execute the RGV evolution pipeline."""
-        from holonpolis.services.evolution_service import (
-            EvolutionService, ToolSchema
-        )
+        from holonpolis.domain.skills import ToolSchema
+        from holonpolis.services.evolution_service import EvolutionService
         from holonpolis.genesis.genesis_memory import GenesisMemory
 
         try:
@@ -402,19 +426,12 @@ class HolonRuntime:
             )
             if request.test_cases:
                 request.status = EvolutionStatus.GREEN_PHASE
-                skill_code = await self._generate_skill_code(
-                    request.skill_name,
-                    request.description,
-                    request.requirements,
-                    request.test_cases,
-                    request.parent_skills,
-                )
-                result = await evolution_service.evolve_skill(
+                result = await evolution_service.evolve_skill_with_test_cases(
                     holon_id=self.holon_id,
                     skill_name=request.skill_name,
-                    code=skill_code,
-                    tests=await self._generate_pytest(request.test_cases),
                     description=request.description,
+                    requirements=request.requirements,
+                    test_cases=request.test_cases,
                     tool_schema=tool_schema,
                 )
             else:
@@ -475,101 +492,7 @@ class HolonRuntime:
                 error=str(e),
             )
 
-        request.completed_at = datetime.utcnow().isoformat()
-
-    async def _generate_test_cases(
-        self,
-        description: str,
-        requirements: List[str],
-    ) -> List[Dict[str, Any]]:
-        """Generate test cases for the Red phase."""
-        prompt = f"""Generate pytest test cases for a skill:
-Description: {description}
-Requirements:
-""" + "\n".join(f"- {r}" for r in requirements)
-
-        response = await self.llm.chat(
-            system_prompt="You are a test engineer. Generate comprehensive pytest test cases.",
-            user_prompt=prompt,
-            config=LLMConfig(max_tokens=4000),
-        )
-
-        content = response.content.strip()
-        # Try strict JSON first.
-        try:
-            parsed = json.loads(content)
-            if isinstance(parsed, list):
-                return [item for item in parsed if isinstance(item, dict)]
-            if isinstance(parsed, dict) and isinstance(parsed.get("test_cases"), list):
-                return [item for item in parsed["test_cases"] if isinstance(item, dict)]
-        except json.JSONDecodeError:
-            pass
-
-        # Fallback: guarantee at least one basic case to avoid empty pytest suite.
-        return [
-            {
-                "description": f"Skill behavior satisfies requirement: {requirements[0] if requirements else description}",
-                "input": {"sample": "input"},
-                "expected": None,
-            }
-        ]
-
-    async def _generate_skill_code(
-        self,
-        skill_name: str,
-        description: str,
-        requirements: List[str],
-        test_cases: List[Dict[str, Any]],
-        parent_skills: List[str],
-    ) -> str:
-        """Generate skill code for the Green phase."""
-        # Recall parent skills for composition
-        parent_context = ""
-        for parent_id in parent_skills:
-            parent_memories = await self.recall(f"skill {parent_id}", top_k=2)
-            if parent_memories:
-                parent_context += f"\nParent skill {parent_id}: {parent_memories[0]['content'][:200]}"
-
-        prompt = f"""Generate Python code for skill: {skill_name}
-Description: {description}
-Requirements:
-""" + "\n".join(f"- {r}" for r in requirements) + parent_context
-
-        response = await self.llm.chat(
-            system_prompt="You are an expert Python developer. Generate clean, tested code.",
-            user_prompt=prompt,
-            config=LLMConfig(max_tokens=8000),
-        )
-
-        return response.content
-
-    async def _generate_pytest(self, test_cases: List[Dict[str, Any]]) -> str:
-        """Generate pytest code from test cases."""
-        if not test_cases:
-            # Avoid "collected 0 items" failure in pytest green phase.
-            return (
-                "import skill_module\n\n"
-                "def test_skill_module_importable():\n"
-                "    assert skill_module is not None\n"
-            )
-
-        lines = ["import skill_module", ""]
-        for i, tc in enumerate(test_cases, 1):
-            desc = str(tc.get("description", f"test_case_{i}")).replace('"', "'")
-            lines.append(f"def test_case_{i}():")
-            lines.append(f"    \"\"\"{desc}\"\"\"")
-            expected = tc.get("expected")
-            if isinstance(expected, bool):
-                lines.append(f"    assert {str(expected)} is {str(expected)}")
-            elif isinstance(expected, (int, float)):
-                lines.append(f"    assert {repr(expected)} == {repr(expected)}")
-            elif isinstance(expected, str):
-                safe = expected.replace('"', '\\"')
-                lines.append(f"    assert \"{safe}\" in \"{safe}\"")
-            else:
-                lines.append("    assert skill_module is not None")
-            lines.append("")
-        return "\n".join(lines).strip() + "\n"
+        request.completed_at = utc_now_iso()
 
     async def _learn_from_evolution_failure(
         self,
@@ -698,6 +621,237 @@ Requirements:
         """Get status of an evolution request."""
         return self._evolution_requests.get(request_id)
 
+    def list_skills(self) -> List[Dict[str, Any]]:
+        """List persisted evolved skills for this Holon."""
+        manifests: Dict[str, Dict[str, Any]] = {}
+        for skill_dir in self._iter_skill_dirs():
+            manifest_path = skill_dir / "manifest.json"
+            if not manifest_path.exists():
+                continue
+            try:
+                manifest = SkillManifest.from_dict(
+                    json.loads(manifest_path.read_text(encoding="utf-8"))
+                )
+            except Exception:
+                continue
+
+            manifests[manifest.skill_id] = {
+                "skill_id": manifest.skill_id,
+                "name": manifest.name,
+                "description": manifest.description,
+                "version": manifest.version,
+                "path": str(skill_dir),
+            }
+
+        return sorted(manifests.values(), key=lambda item: item["name"].lower())
+
+    def get_skill(self, skill_name_or_id: str) -> LoadedSkill:
+        """Load an evolved skill by skill_id or skill name."""
+        skill_dir = self._resolve_skill_directory(skill_name_or_id)
+        if skill_dir is None:
+            raise FileNotFoundError(f"Skill '{skill_name_or_id}' not found")
+
+        manifest = self._read_skill_manifest(skill_dir)
+        latest = manifest.versions[-1] if manifest.versions else None
+        if latest is not None and not latest.static_scan_passed:
+            raise RuntimeError(
+                f"Skill '{manifest.name}' latest version failed static verification"
+            )
+
+        module = self._load_skill_module(manifest, skill_dir)
+        entrypoint = self._select_skill_callable(module, manifest)
+
+        async def _executor(params: Dict[str, Any]) -> Any:
+            return await self._invoke_skill_callable(entrypoint, params)
+
+        return LoadedSkill(
+            skill_id=manifest.skill_id,
+            name=manifest.name,
+            description=manifest.description,
+            version=manifest.version,
+            tool_schema=manifest.tool_schema.to_dict(),
+            _executor=_executor,
+        )
+
+    async def execute_skill(
+        self,
+        skill_name_or_id: str,
+        payload: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Convenience wrapper to execute a persisted evolved skill."""
+        skill = self.get_skill(skill_name_or_id)
+        return await skill.execute(payload=payload, **kwargs)
+
+    def _iter_skill_roots(self) -> List[Path]:
+        guard = HolonPathGuard(self.holon_id)
+        roots: List[Path] = []
+        for rel_path in ("skills_local", "skills"):
+            root = guard.resolve(rel_path, must_exist=False)
+            if root.exists() and root.is_dir():
+                roots.append(root)
+        return roots
+
+    def _iter_skill_dirs(self) -> List[Path]:
+        skill_dirs: List[Path] = []
+        for root in self._iter_skill_roots():
+            for child in root.iterdir():
+                if child.is_dir():
+                    skill_dirs.append(child)
+        return skill_dirs
+
+    def _resolve_skill_directory(self, skill_name_or_id: str) -> Optional[Path]:
+        slug = self._slugify(skill_name_or_id)
+        for root in self._iter_skill_roots():
+            candidate = root / slug
+            if candidate.exists() and candidate.is_dir():
+                return candidate
+
+        needle = skill_name_or_id.strip().lower()
+        for skill_dir in self._iter_skill_dirs():
+            manifest_path = skill_dir / "manifest.json"
+            if not manifest_path.exists():
+                continue
+            try:
+                manifest = SkillManifest.from_dict(
+                    json.loads(manifest_path.read_text(encoding="utf-8"))
+                )
+            except Exception:
+                continue
+            if manifest.skill_id.lower() == needle or manifest.name.strip().lower() == needle:
+                return skill_dir
+        return None
+
+    def _read_skill_manifest(self, skill_dir: Path) -> SkillManifest:
+        manifest_path = skill_dir / "manifest.json"
+        if not manifest_path.exists():
+            raise FileNotFoundError(f"Manifest not found: {manifest_path}")
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        return SkillManifest.from_dict(data)
+
+    def _resolve_skill_code_path(self, manifest: SkillManifest, skill_dir: Path) -> Path:
+        guard = HolonPathGuard(self.holon_id)
+        version_entry = manifest.versions[-1] if manifest.versions else None
+        candidate = version_entry.code_path if version_entry else ""
+        if candidate:
+            candidate_path = Path(candidate)
+            if candidate_path.is_absolute():
+                if candidate_path.exists():
+                    return candidate_path
+            else:
+                try:
+                    resolved = guard.resolve(candidate_path)
+                    if resolved.exists():
+                        return resolved
+                except Exception:
+                    pass
+        fallback = skill_dir / "skill.py"
+        if not fallback.exists():
+            raise FileNotFoundError(f"Skill code not found: {fallback}")
+        return fallback
+
+    def _load_skill_module(self, manifest: SkillManifest, skill_dir: Path) -> ModuleType:
+        code_path = self._resolve_skill_code_path(manifest, skill_dir)
+        module_key = f"holon_skill_{self.holon_id}_{manifest.skill_id}_{hash(str(code_path)) & 0xfffffff}"
+        spec = importlib.util.spec_from_file_location(module_key, str(code_path))
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Unable to load skill module from {code_path}")
+
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _select_skill_callable(self, module: ModuleType, manifest: SkillManifest) -> Callable[..., Any]:
+        if hasattr(module, "execute") and callable(getattr(module, "execute")):
+            return getattr(module, "execute")
+
+        schema_name = manifest.tool_schema.name.strip()
+        for candidate_name in (schema_name, self._slugify(schema_name), manifest.skill_id):
+            if hasattr(module, candidate_name):
+                candidate = getattr(module, candidate_name)
+                if callable(candidate):
+                    return candidate
+
+        public_callables: List[Callable[..., Any]] = []
+        for name in dir(module):
+            if name.startswith("_"):
+                continue
+            candidate = getattr(module, name)
+            if callable(candidate):
+                public_callables.append(candidate)
+
+        if len(public_callables) == 1:
+            return public_callables[0]
+
+        raise RuntimeError(
+            f"Skill '{manifest.name}' does not expose a clear callable entrypoint"
+        )
+
+    async def _invoke_skill_callable(
+        self,
+        fn: Callable[..., Any],
+        params: Dict[str, Any],
+    ) -> Any:
+        signature = inspect.signature(fn)
+        positional_only = [
+            p for p in signature.parameters.values()
+            if p.kind == inspect.Parameter.POSITIONAL_ONLY
+        ]
+        required_named = [
+            p for p in signature.parameters.values()
+            if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+            and p.default is inspect.Parameter.empty
+        ]
+        supports_kwargs = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in signature.parameters.values()
+        )
+
+        if not signature.parameters:
+            result = fn()
+        elif len(signature.parameters) == 1 and not supports_kwargs and not positional_only:
+            only_param = next(iter(signature.parameters.values()))
+            if only_param.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            ) and only_param.name in params and len(params) == 1:
+                result = fn(**params)
+            else:
+                result = fn(params)
+        elif positional_only:
+            # Fallback for unusual signatures: pass full payload as single positional argument.
+            result = fn(params)
+        else:
+            call_args: Dict[str, Any] = {}
+            for param in signature.parameters.values():
+                if param.kind in (
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                ):
+                    if param.name in params:
+                        call_args[param.name] = params[param.name]
+                    elif param.default is inspect.Parameter.empty:
+                        raise ValueError(f"Missing required skill argument: {param.name}")
+            if supports_kwargs:
+                for key, value in params.items():
+                    if key not in call_args:
+                        call_args[key] = value
+            elif any(p.name not in params for p in required_named):
+                missing = [p.name for p in required_named if p.name not in params]
+                raise ValueError(f"Missing required skill arguments: {', '.join(missing)}")
+            result = fn(**call_args)
+
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    @staticmethod
+    def _slugify(name: str) -> str:
+        import re
+
+        slug = re.sub(r"[^a-zA-Z0-9]+", "_", name.strip().lower()).strip("_")
+        return slug or "skill"
+
     async def execute_tool(
         self,
         tool: str,
@@ -818,6 +972,81 @@ Requirements:
             "evolved_skills": len(self.state.skills),
             "evolution_requests": len(self.state.evolution_requests),
         }
+
+    async def run_selection(self, threshold: float = 0.3) -> Dict[str, Any]:
+        """Execute market selection and return ecosystem survival stats."""
+        from holonpolis.services.market_service import MarketService
+
+        market = MarketService()
+        result = market.run_selection(threshold=threshold)
+        await self.remember(
+            content=(
+                f"Selection executed with threshold={threshold}: "
+                f"{result.get('survivors', 0)}/{result.get('total', 0)} survived"
+            ),
+            tags=["selection", "market"],
+            importance=0.7,
+        )
+        return result
+
+    def get_market_stats(self) -> Dict[str, Any]:
+        """Get current aggregated market statistics."""
+        from holonpolis.services.market_service import MarketService
+
+        return MarketService().get_market_stats()
+
+    async def register_relationship(
+        self,
+        target_holon_id: str,
+        relationship_type: str = "peer",
+        strength: float = 0.5,
+        trust_score: float = 0.5,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Create a social relationship edge and persist it."""
+        from holonpolis.domain.social import RelationshipType, SocialRelationship
+        from holonpolis.services.collaboration_service import CollaborationService
+
+        rel_type = RelationshipType(relationship_type.lower())
+        relationship = SocialRelationship(
+            relationship_id=f"rel_{uuid.uuid4().hex[:12]}",
+            source_holon=self.holon_id,
+            target_holon=target_holon_id,
+            rel_type=rel_type,
+            strength=max(0.0, min(1.0, strength)),
+            trust_score=max(0.0, min(1.0, trust_score)),
+            metadata=metadata or {},
+        )
+
+        service = CollaborationService()
+        service.register_relationship(relationship)
+
+        await self.remember(
+            content=(
+                f"Established {rel_type.value} relationship with {target_holon_id} "
+                f"(strength={relationship.strength:.2f}, trust={relationship.trust_score:.2f})"
+            ),
+            tags=["social", "relationship", rel_type.value],
+            importance=0.7,
+        )
+        return relationship.relationship_id
+
+    async def propagate_trust(self, target_holon_id: str, max_hops: int = 2) -> float:
+        """Estimate trust toward another Holon through social graph propagation."""
+        from holonpolis.services.collaboration_service import CollaborationService
+
+        service = CollaborationService()
+        trust = service.social_graph.propagate_trust(
+            source_holon=self.holon_id,
+            target_holon=target_holon_id,
+            max_hops=max_hops,
+        )
+        await self.remember(
+            content=f"Propagated trust to {target_holon_id}: {trust:.3f} (max_hops={max_hops})",
+            tags=["social", "trust"],
+            importance=0.5,
+        )
+        return trust
 
     # ========== Social Capabilities ==========
 

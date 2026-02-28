@@ -475,6 +475,44 @@ def test_add():
         assert result.phase == "green"
 
 
+class TestEvolutionFromTestCases:
+    """给定语义测试用例的演化测试."""
+
+    @pytest.mark.asyncio
+    async def test_evolve_skill_with_explicit_test_cases(self, evolution_setup, tool_schema, monkeypatch):
+        service = EvolutionService()
+
+        async def fake_generate_code(skill_name, description, requirements, tests):
+            assert "test_case_1" in tests
+            return """
+def execute(a, b):
+    return a + b
+"""
+
+        monkeypatch.setattr(service, "_generate_code_via_llm", fake_generate_code)
+
+        result = await service.evolve_skill_with_test_cases(
+            holon_id="case_holon_001",
+            skill_name="CaseAdder",
+            description="Add two numbers from explicit test cases",
+            requirements=["Support numeric addition"],
+            test_cases=[
+                {
+                    "description": "add integers",
+                    "function": "execute",
+                    "input": {"a": 2, "b": 3},
+                    "expected": 5,
+                }
+            ],
+            tool_schema=tool_schema,
+            version="0.1.0",
+        )
+
+        assert result.success is True
+        assert result.phase == "complete"
+        assert result.skill_id == "caseadder"
+
+
 class TestAttestation:
     """Attestation 测试."""
 

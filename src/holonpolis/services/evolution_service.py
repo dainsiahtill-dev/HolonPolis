@@ -19,7 +19,6 @@ import json
 import re
 import tempfile
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -27,6 +26,7 @@ import structlog
 
 from holonpolis.config import settings
 from holonpolis.domain.skills import SkillManifest, SkillVersion, ToolSchema
+from holonpolis.infrastructure.time_utils import utc_now_iso
 from holonpolis.kernel.llm.llm_runtime import LLMConfig, get_llm_runtime
 from holonpolis.kernel.sandbox import SandboxConfig, SandboxRunner
 from holonpolis.kernel.storage import HolonPathGuard
@@ -56,7 +56,7 @@ class Attestation:
     security_scan_results: Dict[str, Any] = field(default_factory=dict)
     code_hash: str = ""
     test_hash: str = ""
-    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = field(default_factory=utc_now_iso)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -423,6 +423,44 @@ class EvolutionService:
             version=version,
         )
 
+    async def evolve_skill_with_test_cases(
+        self,
+        holon_id: str,
+        skill_name: str,
+        description: str,
+        requirements: List[str],
+        test_cases: List[Dict[str, Any]],
+        tool_schema: ToolSchema,
+        version: str = "0.1.0",
+    ) -> EvolutionResult:
+        """Evolve a skill from explicit test cases supplied by caller."""
+        if not test_cases:
+            return await self.evolve_skill_autonomous(
+                holon_id=holon_id,
+                skill_name=skill_name,
+                description=description,
+                requirements=requirements,
+                tool_schema=tool_schema,
+                version=version,
+            )
+
+        tests = self._render_pytest_from_test_cases(test_cases)
+        code = await self._generate_code_via_llm(
+            skill_name=skill_name,
+            description=description,
+            requirements=requirements,
+            tests=tests,
+        )
+        return await self.evolve_skill(
+            holon_id=holon_id,
+            skill_name=skill_name,
+            code=code,
+            tests=tests,
+            description=description,
+            tool_schema=tool_schema,
+            version=version,
+        )
+
     async def evolve_react_project_auto(self, *args, **kwargs) -> EvolutionResult:  # Compatibility stub
         """Previously hardcoded React generator has been removed."""
         return EvolutionResult(
@@ -716,6 +754,69 @@ Tests that must pass:
     @staticmethod
     def _hash_text(text: str) -> str:
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _render_pytest_from_test_cases(test_cases: List[Dict[str, Any]]) -> str:
+        """Render deterministic pytest code from semantic test case definitions."""
+        if not test_cases:
+            return (
+                "import skill_module\n\n"
+                "def test_skill_module_importable():\n"
+                "    assert skill_module is not None\n"
+            )
+
+        lines = [
+            "import asyncio",
+            "import inspect",
+            "import skill_module",
+            "",
+            "def _select_callable(function_name=None):",
+            "    if function_name and hasattr(skill_module, function_name):",
+            "        candidate = getattr(skill_module, function_name)",
+            "        if callable(candidate):",
+            "            return candidate",
+            "    if hasattr(skill_module, 'execute') and callable(skill_module.execute):",
+            "        return skill_module.execute",
+            "    public_callables = []",
+            "    for name in dir(skill_module):",
+            "        if name.startswith('_'):",
+            "            continue",
+            "        candidate = getattr(skill_module, name)",
+            "        if callable(candidate):",
+            "            public_callables.append(candidate)",
+            "    if len(public_callables) == 1:",
+            "        return public_callables[0]",
+            "    raise AssertionError('No unambiguous callable found in skill_module')",
+            "",
+            "def _invoke(function_name, payload):",
+            "    fn = _select_callable(function_name)",
+            "    if isinstance(payload, dict):",
+            "        result = fn(**payload)",
+            "    elif isinstance(payload, (list, tuple)):",
+            "        result = fn(*payload)",
+            "    elif payload is None:",
+            "        result = fn()",
+            "    else:",
+            "        result = fn(payload)",
+            "    if inspect.isawaitable(result):",
+            "        return asyncio.run(result)",
+            "    return result",
+            "",
+        ]
+
+        for index, case in enumerate(test_cases, 1):
+            description = str(case.get("description", f"test_case_{index}")).replace('"', "'")
+            function_name = case.get("function")
+            payload = case.get("input")
+            expected = case.get("expected")
+
+            lines.append(f"def test_case_{index}():")
+            lines.append(f'    """{description}"""')
+            lines.append(f"    result = _invoke({function_name!r}, {payload!r})")
+            lines.append(f"    assert result == {expected!r}")
+            lines.append("")
+
+        return "\n".join(lines).rstrip() + "\n"
 
     @staticmethod
     def _resolve_skill_path(

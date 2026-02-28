@@ -1,8 +1,9 @@
 """Skill definitions and manifests."""
 
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Any, Dict, List, Optional
+
+from holonpolis.infrastructure.time_utils import utc_now_iso
 
 
 @dataclass
@@ -28,7 +29,7 @@ class SkillVersion:
     """Specific version of a skill."""
 
     version: str  # semver
-    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = field(default_factory=utc_now_iso)
     created_by: str = ""  # holon_id that evolved this
 
     # Code location
@@ -70,8 +71,8 @@ class SkillManifest:
     parent_skill: Optional[str] = None  # If evolved from another
     evolution_count: int = 0
 
-    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
-    updated_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = field(default_factory=utc_now_iso)
+    updated_at: str = field(default_factory=utc_now_iso)
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to dict."""
@@ -145,6 +146,6 @@ class SkillManifest:
             versions=versions,
             parent_skill=data.get("parent_skill"),
             evolution_count=data.get("evolution_count", 0),
-            created_at=data.get("created_at", datetime.utcnow().isoformat()),
-            updated_at=data.get("updated_at", datetime.utcnow().isoformat()),
+            created_at=data.get("created_at", utc_now_iso()),
+            updated_at=data.get("updated_at", utc_now_iso()),
         )

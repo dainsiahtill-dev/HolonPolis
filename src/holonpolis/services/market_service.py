@@ -10,13 +10,13 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import structlog
 
 from holonpolis.config import settings
 from holonpolis.domain.social import CompetitionResult, MarketOffer, Reputation
+from holonpolis.infrastructure.time_utils import utc_now, utc_now_iso
 from holonpolis.services.holon_service import HolonService
 from holonpolis.services.social_state_store import SocialStateStore
 
@@ -88,7 +88,7 @@ class MarketService:
             "offers": [self._offer_to_dict(item) for item in self.offers.values()],
             "reputations": [self._reputation_to_dict(item) for item in self.reputation_registry.values()],
             "competition_history": [self._competition_to_dict(item) for item in self.competition_history],
-            "updated_at": datetime.utcnow().isoformat(),
+            "updated_at": utc_now_iso(),
         }
         self._state_store.save_market_state(payload)
 
@@ -125,7 +125,7 @@ class MarketService:
             rating=float(data.get("rating", 0.0)),
             reviews=list(data.get("reviews", [])),
             is_active=bool(data.get("is_active", True)),
-            created_at=str(data.get("created_at", datetime.utcnow().isoformat())),
+            created_at=str(data.get("created_at", utc_now_iso())),
         )
 
     @staticmethod
@@ -183,7 +183,7 @@ class MarketService:
             ranking=list(data.get("ranking", [])),
             winner=data.get("winner"),
             rewards=dict(data.get("rewards", {})),
-            completed_at=str(data.get("completed_at", datetime.utcnow().isoformat())),
+            completed_at=str(data.get("completed_at", utc_now_iso())),
         )
 
     # ========== 市场管理 ==========
@@ -324,7 +324,7 @@ class MarketService:
                 offer.rating = (offer.rating * (offer.usage_count - 1) + user_rating) / offer.usage_count
 
             offer.reviews.append({
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": utc_now_iso(),
                 "rating": user_rating,
                 "success": success,
             })
@@ -427,7 +427,7 @@ class MarketService:
         """评估单个 Holon 的表现。"""
         scores = {dim: 0.5 for dim in criteria.keys()}
 
-        start_time = datetime.utcnow()
+        start_time = utc_now()
 
         try:
             # 执行测试用例
@@ -444,7 +444,7 @@ class MarketService:
             scores["accuracy"] = correct / len(test_cases) if test_cases else 0.5
 
             # 速度
-            elapsed = (datetime.utcnow() - start_time).total_seconds()
+            elapsed = (utc_now() - start_time).total_seconds()
             scores["speed"] = max(0.0, 1.0 - elapsed / 60)  # 60秒内完成得满分
 
             # 成本 (token 使用)

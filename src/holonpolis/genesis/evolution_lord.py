@@ -6,7 +6,6 @@ Produces structured decisions: Route or Spawn.
 import json
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -15,6 +14,7 @@ import structlog
 from holonpolis.config import settings
 from holonpolis.domain import Blueprint, Boundary, EvolutionPolicy
 from holonpolis.domain.blueprints import EvolutionStrategy
+from holonpolis.infrastructure.time_utils import utc_now_iso
 from holonpolis.kernel.llm.llm_runtime import LLMConfig, LLMMessage, get_llm_runtime
 
 logger = structlog.get_logger()
@@ -350,5 +350,5 @@ class EvolutionLord:
             boundary=boundary,
             evolution_policy=policy,
             initial_memory_tags=data.get("initial_memory_tags", []),
-            created_at=datetime.utcnow().isoformat(),
+            created_at=utc_now_iso(),
         )

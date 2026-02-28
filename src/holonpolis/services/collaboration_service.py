@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import structlog
@@ -27,6 +26,7 @@ from holonpolis.domain.social import (
     SocialGraph,
     SubTask,
 )
+from holonpolis.infrastructure.time_utils import utc_now_iso
 from holonpolis.runtime.holon_runtime import HolonRuntime
 from holonpolis.services.holon_service import HolonService
 from holonpolis.services.social_state_store import SocialStateStore
@@ -84,7 +84,7 @@ class CollaborationService:
         payload = {
             "active_collaborations": [self._task_to_dict(task) for task in _GLOBAL_ACTIVE_COLLABORATIONS.values()],
             "social_graph": self._social_graph_to_dict(_GLOBAL_SOCIAL_GRAPH),
-            "updated_at": datetime.utcnow().isoformat(),
+            "updated_at": utc_now_iso(),
         }
         self._state_store.save_collaboration_state(payload)
 
@@ -109,7 +109,7 @@ class CollaborationService:
                 rel_type=rel_type,
                 strength=float(rel_data.get("strength", 0.5)),
                 trust_score=float(rel_data.get("trust_score", 0.5)),
-                created_at=str(rel_data.get("created_at", datetime.utcnow().isoformat())),
+                created_at=str(rel_data.get("created_at", utc_now_iso())),
                 last_interaction=rel_data.get("last_interaction"),
                 interaction_count=int(rel_data.get("interaction_count", 0)),
                 metadata=dict(rel_data.get("metadata", {})),
@@ -184,7 +184,7 @@ class CollaborationService:
             dependencies=dict(data.get("dependencies", {})),
             deliverables=list(data.get("deliverables", [])),
             result=data.get("result"),
-            created_at=str(data.get("created_at", datetime.utcnow().isoformat())),
+            created_at=str(data.get("created_at", utc_now_iso())),
             started_at=data.get("started_at"),
             completed_at=data.get("completed_at"),
             deadline=data.get("deadline"),
@@ -330,7 +330,7 @@ class CollaborationService:
             return False
 
         task.state = CollaborationState.ACTIVE
-        task.started_at = datetime.utcnow().isoformat()
+        task.started_at = utc_now_iso()
 
         logger.info("collaboration_started", task_id=task_id)
 
@@ -403,7 +403,7 @@ class CollaborationService:
             task.state = CollaborationState.FAILED
             logger.error("collaboration_error", task_id=task_id, error=str(e))
 
-        task.completed_at = datetime.utcnow().isoformat()
+        task.completed_at = utc_now_iso()
         self.persist_state()
 
     async def _assign_subtasks(self, task: CollaborationTask) -> None:

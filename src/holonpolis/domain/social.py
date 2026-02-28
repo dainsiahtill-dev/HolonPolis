@@ -10,9 +10,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+from holonpolis.infrastructure.time_utils import utc_now_iso
 
 
 class RelationshipType(Enum):
@@ -44,7 +45,7 @@ class SocialRelationship:
     rel_type: RelationshipType
     strength: float = 0.5       # 关系强度 0-1
     trust_score: float = 0.5    # 信任分数 0-1
-    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = field(default_factory=utc_now_iso)
     last_interaction: Optional[str] = None
     interaction_count: int = 0
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -52,7 +53,7 @@ class SocialRelationship:
     def record_interaction(self, outcome: str, quality: float = 0.5) -> None:
         """记录一次交互并更新关系。"""
         self.interaction_count += 1
-        self.last_interaction = datetime.utcnow().isoformat()
+        self.last_interaction = utc_now_iso()
 
         # 根据交互结果更新信任分数
         if outcome == "success":
@@ -84,7 +85,7 @@ class CollaborationTask:
     result: Optional[Dict[str, Any]] = None
 
     # 时间
-    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = field(default_factory=utc_now_iso)
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
     deadline: Optional[str] = None
@@ -132,7 +133,7 @@ class Reputation:
     def update(self, event_type: str, outcome: str, rating: float = 0.5) -> None:
         """更新声誉。"""
         record = {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": utc_now_iso(),
             "event": event_type,
             "outcome": outcome,
             "rating": rating,
@@ -185,7 +186,7 @@ class MarketOffer:
 
     # 状态
     is_active: bool = True
-    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = field(default_factory=utc_now_iso)
 
 
 @dataclass
@@ -205,7 +206,7 @@ class CompetitionResult:
     winner: Optional[str] = None
     rewards: Dict[str, float] = field(default_factory=dict)  # holon_id -> token_reward
 
-    completed_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    completed_at: str = field(default_factory=utc_now_iso)
 
 
 class SocialGraph:

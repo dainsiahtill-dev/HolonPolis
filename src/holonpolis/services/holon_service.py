@@ -5,7 +5,6 @@ Creates and manages Holon directories, blueprints, and databases.
 
 import json
 import shutil
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -14,6 +13,7 @@ import structlog
 from holonpolis.config import settings
 from holonpolis.domain import Blueprint
 from holonpolis.domain.errors import HolonNotFoundError
+from holonpolis.infrastructure.time_utils import utc_now_iso
 from holonpolis.infrastructure.storage.path_guard import safe_join, validate_holon_id
 from holonpolis.kernel.lancedb.lancedb_factory import get_lancedb_factory
 
@@ -157,7 +157,7 @@ class HolonService:
 
         state = {
             "status": "frozen",
-            "frozen_at": datetime.utcnow().isoformat(),
+            "frozen_at": utc_now_iso(),
         }
 
         state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
@@ -172,7 +172,7 @@ class HolonService:
         if state_path.exists():
             state = {
                 "status": "active",
-                "resumed_at": datetime.utcnow().isoformat(),
+                "resumed_at": utc_now_iso(),
             }
             state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
 

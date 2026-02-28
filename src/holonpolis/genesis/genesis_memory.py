@@ -6,7 +6,6 @@ Genesis has its own LanceDB with three tables:
 - evolutions: History of evolution attempts
 """
 
-from datetime import datetime
 from typing import Any, Dict, List, Optional
 import uuid
 
@@ -14,6 +13,7 @@ import structlog
 
 from holonpolis.kernel.lancedb.lancedb_factory import get_lancedb_factory
 from holonpolis.kernel.embeddings.default_embedder import get_embedder
+from holonpolis.infrastructure.time_utils import utc_now_iso
 
 logger = structlog.get_logger()
 
@@ -59,7 +59,7 @@ class GenesisMemory:
         # Embed the purpose for semantic search
         purpose_embedding = await self.embedder.embed_single(purpose)
 
-        now = datetime.utcnow().isoformat()
+        now = utc_now_iso()
 
         table.add([{
             "holon_id": holon_id,
@@ -105,7 +105,7 @@ class GenesisMemory:
             new_successes = prev_successes + (1 if success else 0)
             new_success_rate = float(new_successes / new_total) if new_total > 0 else 0.0
 
-        now = datetime.utcnow().isoformat()
+        now = utc_now_iso()
         table.add([{
             "holon_id": latest["holon_id"],
             "blueprint_id": latest["blueprint_id"],
@@ -215,7 +215,7 @@ class GenesisMemory:
             "spawned_blueprint_id": spawned_blueprint_id,
             "reasoning": reasoning,
             "outcome": "pending",
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": utc_now_iso(),
         }])
 
         logger.info(
@@ -241,7 +241,7 @@ class GenesisMemory:
             logger.warning("route_outcome_update_skipped", route_id=route_id, reason="route_not_found")
             return
 
-        now = datetime.utcnow().isoformat()
+        now = utc_now_iso()
         table.add([{
             "route_id": latest["route_id"],
             "query": latest["query"],
@@ -269,7 +269,7 @@ class GenesisMemory:
         table = conn.get_table("evolutions")
 
         evolution_id = f"evo_{uuid.uuid4().hex[:12]}"
-        now = datetime.utcnow().isoformat()
+        now = utc_now_iso()
 
         table.add([{
             "evolution_id": evolution_id,
