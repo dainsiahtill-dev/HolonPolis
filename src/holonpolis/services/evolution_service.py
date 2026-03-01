@@ -35,6 +35,44 @@ from holonpolis.services.holon_service import HolonService, HolonUnavailableErro
 
 logger = structlog.get_logger()
 
+_LEADING_REASONING_BLOCK_RE = re.compile(
+    r"^\s*<(think|thinking|reasoning)(?:\s[^>]*)?>.*?</\1>\s*",
+    re.IGNORECASE | re.DOTALL,
+)
+_FENCED_CODE_BLOCK_RE = re.compile(
+    r"```(?:[a-zA-Z0-9_+\-.]+)?\s*\n?(.*?)```",
+    re.DOTALL,
+)
+
+
+def _normalize_llm_output(content: str) -> str:
+    """Normalize provider-specific wrappers before downstream parsing.
+
+    Some reasoning-capable providers prepend XML-like thinking blocks or prose
+    before the actual fenced code. The RGV pipeline expects executable code
+    only, so stripping wrappers at the boundary keeps downstream phases
+    provider-agnostic.
+    """
+    text = str(content or "").strip()
+    if not text:
+        return ""
+
+    while True:
+        stripped = _LEADING_REASONING_BLOCK_RE.sub("", text, count=1).strip()
+        if stripped == text:
+            break
+        text = stripped
+
+    fenced_match = _FENCED_CODE_BLOCK_RE.search(text)
+    if fenced_match:
+        return fenced_match.group(1).strip()
+
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+    if text.endswith("```"):
+        text = text.rsplit("```", 1)[0]
+    return text.strip()
+
 
 # --------------------------------------------------------------------------- #
 # Data structures
@@ -308,12 +346,7 @@ Guidelines:
 
     @staticmethod
     def _strip_code_fences(content: str) -> str:
-        text = content.strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-        if text.endswith("```"):
-            text = text.rsplit("```", 1)[0]
-        return text.strip()
+        return _normalize_llm_output(content)
 
 
 # --------------------------------------------------------------------------- #
@@ -414,6 +447,136 @@ class EvolutionService:
             return await operation()
         finally:
             await self._exit_pending(holon_id)
+
+    @staticmethod
+    def _preferred_roles_for_stage(stage: str) -> List[str]:
+        stage_name = str(stage or "").strip().lower()
+        if stage_name == "generate_tests":
+            return ["qa", "director", "chief_engineer", "architect", "pm"]
+        if stage_name == "repair_tests":
+            return ["qa", "director", "chief_engineer", "architect"]
+        if stage_name == "generate_code":
+            return ["chief_engineer", "architect", "director", "pm", "qa"]
+        if stage_name == "repair_code":
+            return ["chief_engineer", "architect", "director", "qa", "pm"]
+        return ["chief_engineer", "director", "architect", "qa", "pm"]
+
+    def _resolve_stage_llm_config(
+        self,
+        *,
+        holon_id: str,
+        stage: str,
+        base_temperature: float,
+        base_max_tokens: int,
+    ) -> LLMConfig:
+        """Select a configured provider for this stage and rotate across candidates."""
+        bundle = load_provider_bundle()
+        providers = bundle.get("providers")
+        provider_map = providers if isinstance(providers, dict) else {}
+        roles = bundle.get("roles")
+        role_map = roles if isinstance(roles, dict) else {}
+
+        def _is_usable_provider(provider_id: str, provider_cfg: Dict[str, Any]) -> bool:
+            provider_type = str(
+                provider_cfg.get("provider_type") or provider_cfg.get("type") or ""
+            ).strip()
+            if provider_type in {"openai_compat", "anthropic_compat", "gemini_api"}:
+                return bool(str(provider_cfg.get("api_key") or "").strip())
+            if provider_type == "ollama":
+                return bool(str(provider_cfg.get("base_url") or "").strip())
+            return True
+
+        role_candidates: List[Dict[str, str]] = []
+        fallback_candidates: List[Dict[str, str]] = []
+        seen_role: set[str] = set()
+        seen_fallback: set[str] = set()
+        for role_name in self._preferred_roles_for_stage(stage):
+            role_cfg = role_map.get(role_name)
+            if not isinstance(role_cfg, dict):
+                continue
+            provider_id = str(role_cfg.get("provider_id") or "").strip()
+            provider_cfg = provider_map.get(provider_id)
+            if (
+                not provider_id
+                or provider_id in seen_role
+                or provider_id not in provider_map
+                or not isinstance(provider_cfg, dict)
+                or not _is_usable_provider(provider_id, provider_cfg)
+            ):
+                continue
+            role_candidates.append(
+                {
+                    "provider_id": provider_id,
+                    "model": str(role_cfg.get("model") or "").strip(),
+                }
+            )
+            seen_role.add(provider_id)
+
+        for provider_id in sorted(provider_map.keys()):
+            pid = str(provider_id).strip()
+            if not pid or pid in seen_fallback:
+                continue
+            provider_cfg = provider_map.get(pid)
+            if (
+                not isinstance(provider_cfg, dict)
+                or not _is_usable_provider(pid, provider_cfg)
+            ):
+                continue
+            fallback_candidates.append(
+                {
+                    "provider_id": pid,
+                    "model": str(provider_cfg.get("model") or "").strip(),
+                }
+            )
+            seen_fallback.add(pid)
+
+        candidates = role_candidates or fallback_candidates
+
+        if not candidates:
+            fallback_provider = str(bundle.get("default_provider_id") or settings.llm_provider or "").strip()
+            if fallback_provider:
+                candidates.append({"provider_id": fallback_provider, "model": ""})
+
+        if not candidates:
+            return LLMConfig(
+                provider_id=settings.llm_provider,
+                temperature=float(base_temperature),
+                max_tokens=int(base_max_tokens),
+            )
+
+        counters = self._snapshot_llm_counters(holon_id)
+        digest = hashlib.sha256(f"{holon_id}|{stage}".encode("utf-8")).hexdigest()
+        offset = int(digest[:8], 16)
+        candidate = candidates[(offset + counters["call_count"]) % len(candidates)]
+        provider_id = str(candidate.get("provider_id") or "").strip()
+        provider_cfg = provider_map.get(provider_id)
+        if not isinstance(provider_cfg, dict):
+            provider_cfg = {}
+
+        model = str(candidate.get("model") or provider_cfg.get("model") or "").strip() or None
+        try:
+            temperature = float(provider_cfg.get("temperature", base_temperature))
+        except Exception:
+            temperature = float(base_temperature)
+        try:
+            max_tokens = int(provider_cfg.get("max_tokens", base_max_tokens))
+        except Exception:
+            max_tokens = int(base_max_tokens)
+        timeout_value = provider_cfg.get("timeout")
+        timeout_seconds: Optional[int] = None
+        try:
+            if timeout_value is not None:
+                timeout_seconds = int(timeout_value)
+        except Exception:
+            timeout_seconds = None
+
+        return LLMConfig(
+            provider_id=provider_id,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout_seconds=timeout_seconds,
+        )
 
     def _resolve_llm_audit_metadata(self, config: Optional[LLMConfig]) -> Dict[str, str]:
         """Resolve provider metadata for audit visibility without exposing secrets."""
@@ -1161,11 +1324,11 @@ Rules:
 - For project scaffolding skills, validate structure and invariants, not exact full-template file contents.
 - Never require absolute output file paths unless requirements explicitly demand it.
 """
-        config = LLMConfig(
-            provider_id=settings.llm_provider,
-            model=None,
-            temperature=0.2,
-            max_tokens=4000,
+        config = self._resolve_stage_llm_config(
+            holon_id=holon_id,
+            stage="generate_tests",
+            base_temperature=0.2,
+            base_max_tokens=4000,
         )
         response = await self._chat_with_audit(
             holon_id=holon_id,
@@ -1214,10 +1377,11 @@ Implementation rules:
 - Prefer plain triple-quoted strings (without f-prefix) for JS/JSON snippets unless interpolation is strictly required.
 - Keep output deterministic and fully runnable.
 """
-        config = LLMConfig(
-            provider_id=settings.llm_provider,
-            temperature=0.3,
-            max_tokens=8000,
+        config = self._resolve_stage_llm_config(
+            holon_id=holon_id,
+            stage="generate_code",
+            base_temperature=0.3,
+            base_max_tokens=8000,
         )
         response = await self._chat_with_audit(
             holon_id=holon_id,
@@ -1276,10 +1440,11 @@ Repair rules:
 - If previous code used f-strings containing JS/JSON braces and caused syntax errors, remove f-strings or escape braces.
 - Do not leave placeholders; preserve deterministic behavior.
 """
-        config = LLMConfig(
-            provider_id=settings.llm_provider,
-            temperature=0.1,
-            max_tokens=8000,
+        config = self._resolve_stage_llm_config(
+            holon_id=holon_id,
+            stage="repair_code",
+            base_temperature=0.1,
+            base_max_tokens=8000,
         )
         response = await self._chat_with_audit(
             holon_id=holon_id,
@@ -1326,10 +1491,11 @@ Mandatory rules:
 - Do not overfit to a single hardcoded template implementation.
 - Do not require absolute paths unless explicitly required.
 """
-        config = LLMConfig(
-            provider_id=settings.llm_provider,
-            temperature=0.1,
-            max_tokens=6000,
+        config = self._resolve_stage_llm_config(
+            holon_id=holon_id,
+            stage="repair_tests",
+            base_temperature=0.1,
+            base_max_tokens=6000,
         )
         response = await self._chat_with_audit(
             holon_id=holon_id,
@@ -2022,12 +2188,7 @@ def test_output_deterministic():
 
     @staticmethod
     def _strip_code_fences(content: str) -> str:
-        text = content.strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-        if text.endswith("```"):
-            text = text.rsplit("```", 1)[0]
-        return text.strip()
+        return _normalize_llm_output(content)
 
     @staticmethod
     def _slugify(name: str) -> str:

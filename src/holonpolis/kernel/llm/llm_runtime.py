@@ -155,7 +155,15 @@ class OpenAICompatProvider(BaseLLMProvider):
         api_key, base_url = self._resolve_auth(config, provider_config)
         model = self._resolve_model(config, provider_config)
         timeout = (config.timeout_seconds if config else None) or provider_config.get("timeout")
-        client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
+        extra_headers = provider_config.get("extra_headers")
+        if not isinstance(extra_headers, dict):
+            extra_headers = {}
+        client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=timeout,
+            default_headers=extra_headers or None,
+        )
 
         start = time.time()
         params: Dict[str, Any] = {
@@ -225,7 +233,15 @@ class OpenAICompatProvider(BaseLLMProvider):
         api_key, base_url = self._resolve_auth(config, provider_config)
         model = self._resolve_model(config, provider_config)
         timeout = (config.timeout_seconds if config else None) or provider_config.get("timeout")
-        client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
+        extra_headers = provider_config.get("extra_headers")
+        if not isinstance(extra_headers, dict):
+            extra_headers = {}
+        client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=timeout,
+            default_headers=extra_headers or None,
+        )
 
         params: Dict[str, Any] = {
             "model": model,
@@ -287,6 +303,9 @@ class OllamaProvider(BaseLLMProvider):
             "messages": self._convert_messages(messages),
             "stream": False,
         }
+        headers = provider_config.get("extra_headers")
+        if not isinstance(headers, dict):
+            headers = {}
         options = (config.extra if config else {}).get("options")
         if options is None:
             options = provider_config.get("options")
@@ -295,7 +314,7 @@ class OllamaProvider(BaseLLMProvider):
 
         start = time.time()
         async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(url, json=payload)
+            response = await client.post(url, json=payload, headers=headers or None)
             response.raise_for_status()
             data = response.json()
 
@@ -341,9 +360,12 @@ class OllamaProvider(BaseLLMProvider):
             "messages": self._convert_messages(messages),
             "stream": True,
         }
+        headers = provider_config.get("extra_headers")
+        if not isinstance(headers, dict):
+            headers = {}
 
         async with httpx.AsyncClient(timeout=timeout) as client:
-            async with client.stream("POST", url, json=payload) as response:
+            async with client.stream("POST", url, json=payload, headers=headers or None) as response:
                 response.raise_for_status()
                 async for line in response.aiter_lines():
                     raw = str(line or "").strip()
@@ -443,6 +465,9 @@ class AnthropicCompatProvider(BaseLLMProvider):
             "anthropic-version": version,
             "x-api-key": api_key,
         }
+        extra_headers = provider_config.get("extra_headers")
+        if isinstance(extra_headers, dict):
+            headers.update(extra_headers)
 
         start = time.time()
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -620,10 +645,14 @@ class LLMRuntime:
         self.provider_configs = providers if isinstance(providers, dict) else {}
 
     def get_provider_bundle(self) -> Dict[str, Any]:
-        return {
+        bundle = {
             "default_provider_id": self.default_provider_id,
             "providers": dict(self.provider_configs),
         }
+        roles = self.provider_bundle.get("roles")
+        if isinstance(roles, dict):
+            bundle["roles"] = dict(roles)
+        return bundle
 
     def _resolve_provider(
         self, config: Optional[LLMConfig]
@@ -704,4 +733,3 @@ def reset_llm_runtime() -> None:
     """Reset global runtime (mainly for testing)."""
     global _runtime
     _runtime = None
-

@@ -22,6 +22,7 @@ from holonpolis.services.evolution_service import (
     Attestation,
     EvolutionResult,
     EvolutionService,
+    LLMCodeGenerator,
     SecurityScanner,
 )
 from holonpolis.services.holon_service import HolonService
@@ -301,6 +302,76 @@ async def test_evolution_service_persists_llm_audit_state(evolution_setup, monke
     assert llm["last_status"] == "succeeded"
     assert llm["last_stage"] == "generate_code"
     assert llm["model"] == "audit-test-model"
+
+
+def test_evolution_stage_routing_prefers_role_configured_providers(monkeypatch):
+    """Stage routing should stay within role-configured providers and avoid built-in placeholders."""
+    configured_provider_ids = {"chief", "architect", "qa"}
+    monkeypatch.setattr(
+        "holonpolis.services.evolution_service.load_provider_bundle",
+        lambda: {
+            "default_provider_id": "openai",
+            "providers": {
+                "openai": {"type": "openai_compat"},
+                "anthropic": {"type": "anthropic_compat"},
+                "chief": {
+                    "type": "anthropic_compat",
+                    "api_key": "test-chief-key",
+                    "model": "kimi-for-coding",
+                },
+                "architect": {
+                    "type": "openai_compat",
+                    "api_key": "test-architect-key",
+                    "model": "MiniMax-M2.5",
+                },
+                "qa": {
+                    "type": "ollama",
+                    "base_url": "http://127.0.0.1:11434",
+                    "model": "qwen3-coder",
+                },
+            },
+            "roles": {
+                "chief_engineer": {"provider_id": "chief", "model": "kimi-for-coding"},
+                "architect": {"provider_id": "architect", "model": "MiniMax-M2.5"},
+                "director": {"provider_id": "qa", "model": "qwen3-coder"},
+                "pm": {"provider_id": "architect", "model": "MiniMax-M2.5"},
+                "qa": {"provider_id": "qa", "model": "qwen3-coder"},
+            },
+        },
+    )
+
+    service = EvolutionService()
+    selected: set[str] = set()
+    for idx in range(1, 13):
+        holon_id = f"holon_points_predictor_{idx:03d}"
+        for stage in ("generate_tests", "generate_code", "repair_tests", "repair_code"):
+            cfg = service._resolve_stage_llm_config(
+                holon_id=holon_id,
+                stage=stage,
+                base_temperature=0.2,
+                base_max_tokens=4000,
+            )
+            assert cfg.provider_id in configured_provider_ids
+            selected.add(str(cfg.provider_id))
+
+    assert selected == configured_provider_ids
+
+
+def test_llm_output_normalization_strips_reasoning_wrappers():
+    """Reasoning wrappers and prose should be removed before RGV parses generated code."""
+    raw = (
+        "<think>drafting response</think>\n"
+        "Here is the implementation.\n"
+        "```python\n"
+        "def execute(payload=None):\n"
+        "    return payload or {}\n"
+        "```\n"
+        "This line should be ignored.\n"
+    )
+
+    expected = "def execute(payload=None):\n    return payload or {}"
+    assert LLMCodeGenerator._strip_code_fences(raw) == expected
+    assert EvolutionService._strip_code_fences(raw) == expected
 
 
 class TestGreenPhase:

@@ -121,6 +121,10 @@ def _config_file_path() -> Path:
     return settings.holonpolis_root / "config" / "llm" / "providers.json"
 
 
+def _legacy_config_file_path() -> Path:
+    return settings.holonpolis_root / "config" / "llm_config.json"
+
+
 def _load_json_dict(path: Path) -> Dict[str, Any]:
     if not path.is_file():
         return {}
@@ -129,6 +133,100 @@ def _load_json_dict(path: Path) -> Dict[str, Any]:
     except Exception:
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _normalize_provider_type_name(provider_type: str) -> str:
+    normalized = str(provider_type or "").strip()
+    alias_map = {
+        "minimax": "openai_compat",
+    }
+    return alias_map.get(normalized, normalized)
+
+
+def _default_api_path_for_type(provider_type: str) -> str:
+    normalized = _normalize_provider_type_name(provider_type)
+    if normalized == "ollama":
+        return "/api/chat"
+    if normalized == "anthropic_compat":
+        return "/v1/messages"
+    if normalized == "gemini_api":
+        return "/v1beta/models/{model}:generateContent"
+    return "/v1/chat/completions"
+
+
+def _convert_legacy_bundle(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert legacy .holonpolis/config/llm_config.json into runtime bundle shape."""
+    providers_in = payload.get("providers")
+    roles_in = payload.get("roles")
+    providers_out: Dict[str, Dict[str, Any]] = {}
+    if isinstance(providers_in, dict):
+        for provider_id, provider_cfg in providers_in.items():
+            if not isinstance(provider_cfg, dict):
+                continue
+            cfg = dict(provider_cfg)
+            provider_type = _normalize_provider_type_name(
+                str(cfg.get("provider_type") or cfg.get("type") or "").strip()
+            )
+            if not provider_type:
+                continue
+            extra_headers = cfg.get("extra_headers")
+            if not isinstance(extra_headers, dict):
+                extra_headers = {}
+            headers = cfg.get("headers")
+            if isinstance(headers, dict):
+                extra_headers = _deep_merge(extra_headers, headers)
+            max_tokens = cfg.get("max_tokens")
+            if max_tokens is None and cfg.get("max_output_tokens") is not None:
+                max_tokens = cfg.get("max_output_tokens")
+            providers_out[str(provider_id)] = {
+                "provider_id": str(provider_id),
+                "provider_type": provider_type,
+                "type": provider_type,
+                "name": str(cfg.get("name") or provider_id),
+                "base_url": str(cfg.get("base_url") or ""),
+                "api_key": str(cfg.get("api_key") or ""),
+                "api_path": str(cfg.get("api_path") or _default_api_path_for_type(provider_type)),
+                "timeout": int(cfg.get("timeout") or 60),
+                "retries": int(cfg.get("retries") or 3),
+                "temperature": float(cfg.get("temperature") or 0.7),
+                "max_tokens": int(max_tokens or 8192),
+                "model": str(cfg.get("model") or ""),
+                "extra_headers": extra_headers,
+                "model_specific": {},
+            }
+
+    roles_out: Dict[str, Dict[str, Any]] = {}
+    if isinstance(roles_in, dict):
+        for role_name, role_cfg in roles_in.items():
+            if not isinstance(role_cfg, dict):
+                continue
+            provider_id = str(role_cfg.get("provider_id") or "").strip()
+            if not provider_id:
+                continue
+            roles_out[str(role_name)] = {
+                "provider_id": provider_id,
+                "model": str(role_cfg.get("model") or "").strip(),
+                "profile": str(role_cfg.get("profile") or "").strip(),
+            }
+
+    default_provider_id = ""
+    for role_name in ("chief_engineer", "architect", "director", "pm", "qa"):
+        role_cfg = roles_out.get(role_name)
+        if isinstance(role_cfg, dict):
+            candidate = str(role_cfg.get("provider_id") or "").strip()
+            if candidate:
+                default_provider_id = candidate
+                break
+    if not default_provider_id and providers_out:
+        default_provider_id = next(iter(providers_out.keys()))
+
+    out: Dict[str, Any] = {
+        "providers": providers_out,
+        "default_provider_id": default_provider_id,
+    }
+    if roles_out:
+        out["roles"] = roles_out
+    return out
 
 
 def _parse_env_json(var_name: str) -> Dict[str, Any]:
@@ -152,10 +250,26 @@ def _normalize_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(provider_cfg, dict):
             continue
         cfg = dict(provider_cfg)
-        provider_type = str(cfg.get("type") or cfg.get("provider_type") or "").strip()
+        provider_type = _normalize_provider_type_name(
+            str(cfg.get("type") or cfg.get("provider_type") or "").strip()
+        )
         if not provider_type:
             continue
         cfg["type"] = provider_type
+        cfg["provider_type"] = provider_type
+        if "provider_id" not in cfg:
+            cfg["provider_id"] = str(provider_id)
+        extra_headers = cfg.get("extra_headers")
+        if not isinstance(extra_headers, dict):
+            extra_headers = {}
+        headers = cfg.get("headers")
+        if isinstance(headers, dict):
+            extra_headers = _deep_merge(extra_headers, headers)
+        cfg["extra_headers"] = extra_headers
+        if "max_tokens" not in cfg and cfg.get("max_output_tokens") is not None:
+            cfg["max_tokens"] = cfg.get("max_output_tokens")
+        if not str(cfg.get("api_path") or "").strip():
+            cfg["api_path"] = _default_api_path_for_type(provider_type)
         normalized_providers[str(provider_id)] = cfg
 
     default_provider_id = str(bundle.get("default_provider_id") or "").strip()
@@ -164,19 +278,40 @@ def _normalize_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
     if not default_provider_id:
         default_provider_id = "openai"
 
-    return {
+    normalized: Dict[str, Any] = {
         "default_provider_id": default_provider_id,
         "providers": normalized_providers,
     }
+    roles = bundle.get("roles")
+    if isinstance(roles, dict):
+        normalized_roles: Dict[str, Dict[str, Any]] = {}
+        for role_name, role_cfg in roles.items():
+            if not isinstance(role_cfg, dict):
+                continue
+            provider_id = str(role_cfg.get("provider_id") or "").strip()
+            if not provider_id:
+                continue
+            normalized_roles[str(role_name)] = {
+                "provider_id": provider_id,
+                "model": str(role_cfg.get("model") or "").strip(),
+                "profile": str(role_cfg.get("profile") or "").strip(),
+            }
+        if normalized_roles:
+            normalized["roles"] = normalized_roles
+    return normalized
 
 
 def load_provider_bundle() -> Dict[str, Any]:
-    """Load provider bundle from defaults + file + env JSON overrides."""
+    """Load provider bundle from defaults + file + legacy file + env JSON overrides."""
     bundle = build_default_provider_bundle()
 
     file_payload = _load_json_dict(_config_file_path())
     if file_payload:
         bundle = _deep_merge(bundle, file_payload)
+
+    legacy_payload = _load_json_dict(_legacy_config_file_path())
+    if legacy_payload:
+        bundle = _deep_merge(bundle, _convert_legacy_bundle(legacy_payload))
 
     env_payload = _parse_env_json("HOLONPOLIS_LLM_PROVIDERS_JSON")
     if env_payload:

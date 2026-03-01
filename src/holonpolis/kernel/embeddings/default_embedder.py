@@ -116,6 +116,7 @@ def get_embedder() -> EmbeddingProvider:
     global _embedder
     if _embedder is None:
         from holonpolis.config import settings
+        from holonpolis.kernel.llm.provider_config import load_provider_bundle
 
         if settings.embedding_provider.lower() == "openai":
             api_key = settings.openai_api_key or os.environ.get("OPENAI_API_KEY")
@@ -126,7 +127,25 @@ def get_embedder() -> EmbeddingProvider:
                     base_url=settings.openai_base_url,
                 )
             else:
-                logger.warning("openai_not_configured_using_simple_embedder")
+                bundle = load_provider_bundle()
+                default_provider_id = str(bundle.get("default_provider_id") or "").strip()
+                providers = bundle.get("providers")
+                provider_cfg = providers.get(default_provider_id) if isinstance(providers, dict) else None
+                provider_type = ""
+                provider_has_key = False
+                if isinstance(provider_cfg, dict):
+                    provider_type = str(
+                        provider_cfg.get("provider_type") or provider_cfg.get("type") or ""
+                    ).strip()
+                    provider_has_key = bool(str(provider_cfg.get("api_key") or "").strip())
+                if default_provider_id and provider_has_key:
+                    logger.info(
+                        "embedding_openai_unavailable_using_simple_embedder",
+                        llm_default_provider=default_provider_id,
+                        llm_provider_type=provider_type or None,
+                    )
+                else:
+                    logger.warning("openai_not_configured_using_simple_embedder")
                 _embedder = SimpleEmbedder(dimension=settings.embedding_dimension)
         else:
             _embedder = SimpleEmbedder(dimension=settings.embedding_dimension)
