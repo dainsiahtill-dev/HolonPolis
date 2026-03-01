@@ -874,6 +874,12 @@ class HolonRuntime:
                 error=str(e),
             )
             request.completed_at = utc_now_iso()
+            self._finalize_evolution_audit(
+                request,
+                status=EvolutionStatus.FAILED,
+                phase="runtime",
+                error_message=request.error_message,
+            )
             if self._holon_service.get_holon_status(self.holon_id) == "pending":
                 self._holon_service.mark_active(
                     self.holon_id,
@@ -888,6 +894,8 @@ class HolonRuntime:
                 "skill_id": result.skill_id,
                 "attestation_id": result.attestation.attestation_id if result.attestation else None,
                 "code_path": result.code_path,
+                "test_path": getattr(result, "test_path", None),
+                "manifest_path": getattr(result, "manifest_path", None),
             }
             if result.skill_id:
                 self.state.skills.append(result.skill_id)
@@ -910,6 +918,12 @@ class HolonRuntime:
                 skill_id=result.skill_id,
             )
             request.completed_at = utc_now_iso()
+            self._finalize_evolution_audit(
+                request,
+                status=EvolutionStatus.COMPLETED,
+                phase="complete",
+                result_payload=request.result,
+            )
             return
 
         request.status = EvolutionStatus.FAILED
@@ -922,6 +936,12 @@ class HolonRuntime:
         )
         await self._safe_learn_from_evolution_failure(request, result)
         request.completed_at = utc_now_iso()
+        self._finalize_evolution_audit(
+            request,
+            status=EvolutionStatus.FAILED,
+            phase=str(result.phase if result else "runtime").strip() or "runtime",
+            error_message=request.error_message,
+        )
 
     async def _safe_record_evolution(
         self,
@@ -2051,9 +2071,137 @@ class HolonRuntime:
             parent_skills=parent_skill_ids,
         )
 
+    def _finalize_evolution_audit(
+        self,
+        request: EvolutionRequest,
+        *,
+        status: EvolutionStatus,
+        phase: str,
+        result_payload: Optional[Dict[str, Any]] = None,
+        error_message: Optional[str] = None,
+    ) -> None:
+        """Persist terminal request state so status survives timing races and restarts."""
+        terminal_map = {
+            EvolutionStatus.COMPLETED: "success",
+            EvolutionStatus.FAILED: "failed",
+            EvolutionStatus.REJECTED: "rejected",
+        }
+        audit_result = terminal_map.get(status)
+        if audit_result is None:
+            return
+
+        current_state = self._holon_service.get_holon_state(self.holon_id)
+        current_audit = current_state.get("evolution_audit")
+        if isinstance(current_audit, dict):
+            current_request_id = str(current_audit.get("request_id") or "").strip()
+            if current_request_id and current_request_id != request.request_id:
+                return
+
+        payload = dict(result_payload or {})
+        self._holon_service.update_evolution_audit(
+            self.holon_id,
+            patch={
+                "request_id": request.request_id,
+                "lifecycle": "completed",
+                "phase": str(phase or "complete").strip() or "complete",
+                "result": audit_result,
+                "error": "" if status == EvolutionStatus.COMPLETED else str(error_message or "").strip(),
+                "completed_at": str(request.completed_at or utc_now_iso()).strip(),
+                "skill_id": str(payload.get("skill_id") or "").strip(),
+                "attestation_id": str(payload.get("attestation_id") or "").strip(),
+                "code_path": str(payload.get("code_path") or "").strip(),
+                "test_path": str(payload.get("test_path") or "").strip(),
+                "manifest_path": str(payload.get("manifest_path") or "").strip(),
+                "llm": {"inflight": False},
+            },
+        )
+
+    def _hydrate_evolution_request_from_audit(self, request_id: str) -> Optional[EvolutionRequest]:
+        """Reconstruct request state from persisted audit metadata when memory is stale."""
+        state_payload = self._holon_service.get_holon_state(self.holon_id)
+        audit = state_payload.get("evolution_audit")
+        if not isinstance(audit, dict):
+            return None
+        if str(audit.get("request_id") or "").strip() != str(request_id or "").strip():
+            return None
+
+        lifecycle = str(audit.get("lifecycle") or "").strip().lower()
+        result = str(audit.get("result") or "").strip().lower()
+        phase = str(audit.get("phase") or "").strip().lower()
+        reason = str(state_payload.get("reason") or "").strip().lower()
+
+        reconciled_status: Optional[EvolutionStatus]
+        if lifecycle == "completed":
+            if result in {"failed", "failure"} or reason == "evolution_failed_early":
+                reconciled_status = EvolutionStatus.FAILED
+            elif result == "rejected":
+                reconciled_status = EvolutionStatus.REJECTED
+            elif result in {"success", "completed"} or reason == "evolution_complete":
+                reconciled_status = EvolutionStatus.COMPLETED
+            else:
+                reconciled_status = None
+        elif phase == "red":
+            reconciled_status = EvolutionStatus.RED_PHASE
+        elif phase == "green":
+            reconciled_status = EvolutionStatus.GREEN_PHASE
+        elif phase == "verify":
+            reconciled_status = EvolutionStatus.VERIFY_PHASE
+        elif lifecycle == "pending":
+            reconciled_status = EvolutionStatus.PENDING
+        elif lifecycle == "running" or result == "in_progress":
+            reconciled_status = EvolutionStatus.EVOLVING
+        else:
+            reconciled_status = None
+
+        if reconciled_status is None:
+            return None
+
+        request = self._evolution_requests.get(request_id)
+        if request is None:
+            request = EvolutionRequest(
+                request_id=request_id,
+                holon_id=self.holon_id,
+                skill_name=str(audit.get("skill_name") or "").strip(),
+                description="",
+                requirements=[],
+                test_cases=[],
+                parent_skills=[],
+                status=reconciled_status,
+                created_at=(
+                    str(audit.get("started_at") or "").strip()
+                    or str(state_payload.get("pending_at") or "").strip()
+                    or utc_now_iso()
+                ),
+            )
+            self._evolution_requests[request_id] = request
+            if request_id not in self.state.evolution_requests:
+                self.state.evolution_requests.append(request_id)
+        else:
+            request.status = reconciled_status
+
+        completed_at = str(audit.get("completed_at") or state_payload.get("resumed_at") or "").strip()
+        if completed_at:
+            request.completed_at = completed_at
+
+        error_message = str(audit.get("error") or "").strip()
+        if error_message:
+            request.error_message = error_message
+
+        payload: Dict[str, Any] = {}
+        for key in ("skill_id", "attestation_id", "code_path", "test_path", "manifest_path"):
+            value = str(audit.get(key) or "").strip()
+            if value:
+                payload[key] = value
+        if payload:
+            request.result = payload
+
+        return request
+
     def get_evolution_status(self, request_id: str) -> Optional[EvolutionRequest]:
         """Get status of an evolution request."""
-        return self._evolution_requests.get(request_id)
+        request = self._evolution_requests.get(request_id)
+        hydrated = self._hydrate_evolution_request_from_audit(request_id)
+        return hydrated or request
 
     def get_self_reflection(self, history_limit: int = 10) -> Dict[str, Any]:
         """Return the latest persisted self-reflection snapshot with bounded history."""
@@ -2087,6 +2235,7 @@ class HolonRuntime:
             raise ValueError("poll_interval_seconds must be > 0")
 
         deadline = time.monotonic() + timeout_seconds
+        grace_window_seconds = max(1.0, min(5.0, max(1.0, poll_interval_seconds * 5)))
         terminal = {
             EvolutionStatus.COMPLETED,
             EvolutionStatus.FAILED,
@@ -2099,12 +2248,22 @@ class HolonRuntime:
                 raise ValueError(f"Evolution request not found: {request_id}")
             if status.status in terminal:
                 return status
-            if time.monotonic() >= deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                grace_deadline = time.monotonic() + grace_window_seconds
+                while True:
+                    final_status = self.get_evolution_status(request_id)
+                    if final_status is not None and final_status.status in terminal:
+                        return final_status
+                    now = time.monotonic()
+                    if now >= grace_deadline:
+                        break
+                    await asyncio.sleep(min(0.05, grace_deadline - now))
                 raise TimeoutError(
                     f"Timed out waiting for evolution request {request_id} "
                     f"after {timeout_seconds:.1f}s"
                 )
-            await asyncio.sleep(poll_interval_seconds)
+            await asyncio.sleep(min(poll_interval_seconds, remaining))
 
     def list_skills(self) -> List[Dict[str, Any]]:
         """List persisted evolved skills for this Holon."""

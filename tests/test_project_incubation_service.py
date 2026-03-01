@@ -284,6 +284,63 @@ async def test_incubation_injects_reusable_code_assets_into_evolution_requiremen
 
 
 @pytest.mark.asyncio
+async def test_incubation_defaults_to_evolution_only_even_when_reusable_assets_exist(incubation_setup):
+    holon_id = "holon_evolution_only"
+    await _create_holon(holon_id)
+
+    execution_result = {
+        "project_name": "Evolution Demo",
+        "project_slug": "evolution_demo",
+        "files": {
+            "README.md": "# Evolution Demo\n",
+            "package.json": '{"name":"evolution-demo"}\n',
+            "src/main.js": 'console.log("evolved");\n',
+        },
+        "run_instructions": ["npm install", "npm run dev"],
+    }
+    asset_hits = [
+        {
+            "library_key": "dashboard-seed",
+            "library_name": "dashboard-seed",
+            "asset_name": "DashboardShell",
+            "relative_path": "src/components/DashboardShell.jsx",
+            "asset_type": "source",
+            "code_content": "export function DashboardShell() { return null; }\n",
+        }
+    ]
+
+    async def fake_route_or_spawn(user_request, conversation_history=None):
+        return SimpleNamespace(
+            decision="route_to",
+            holon_id=holon_id,
+        )
+
+    genesis = SimpleNamespace(route_or_spawn=fake_route_or_spawn)
+    stub_runtime = _StubRuntime(holon_id, None, execution_result, asset_hits=asset_hits)
+
+    def runtime_factory(runtime_holon_id, blueprint):
+        stub_runtime.blueprint = blueprint
+        return stub_runtime
+
+    service = ProjectIncubationService(
+        genesis_service=genesis,
+        runtime_factory=runtime_factory,
+    )
+    result = await service.incubate_project(
+        ProjectIncubationSpec(
+            project_name="Evolution Demo",
+            project_goal="Build a finance dashboard using our learned component patterns.",
+        )
+    )
+
+    assert result.delivery_mode == "evolved_skill"
+    assert stub_runtime.last_request_kwargs
+    joined = "\n".join(stub_runtime.last_request_kwargs.get("requirements", []))
+    assert "Reference reusable code assets" in joined
+    assert "DashboardShell" in joined
+
+
+@pytest.mark.asyncio
 async def test_incubation_prefers_reusable_scaffold_when_indexed_library_is_available(incubation_setup):
     holon_id = "holon_dashboard_seed"
     await _create_holon(holon_id)
@@ -389,6 +446,7 @@ async def test_incubation_prefers_reusable_scaffold_when_indexed_library_is_avai
             project_name="Dashboard Starter",
             project_goal="Build a dashboard project with sidebar navigation, cards, and table views.",
             required_files=["package.json", "index.html", "src/main.jsx"],
+            prefer_reusable_scaffold=True,
         )
     )
 
@@ -413,3 +471,157 @@ async def test_incubation_prefers_reusable_scaffold_when_indexed_library_is_avai
     report = json.loads((output_dir / "_incubation_report.json").read_text(encoding="utf-8"))
     assert report["delivery_mode"] == "reusable_scaffold"
     assert report["run_instructions"] == ["npm install", "npm run dev"]
+
+
+@pytest.mark.asyncio
+async def test_incubation_can_export_generated_project_without_mutating_runtime_source(incubation_setup):
+    holon_id = "holon_export_delivery"
+    await _create_holon(holon_id)
+
+    execution_result = {
+        "project_name": "Export Demo",
+        "project_slug": "export_demo",
+        "files": {
+            "README.md": "# Export Demo\n",
+            "package.json": '{"name":"export-demo"}\n',
+            "src/main.js": 'console.log("export");\n',
+        },
+        "run_instructions": ["npm install", "npm run dev"],
+    }
+    export_target = incubation_setup.parent / "delivered_project"
+
+    async def fake_route_or_spawn(user_request, conversation_history=None):
+        return SimpleNamespace(
+            decision="route_to",
+            holon_id=holon_id,
+        )
+
+    genesis = SimpleNamespace(route_or_spawn=fake_route_or_spawn)
+
+    def runtime_factory(runtime_holon_id, blueprint):
+        return _StubRuntime(runtime_holon_id, blueprint, execution_result)
+
+    service = ProjectIncubationService(
+        genesis_service=genesis,
+        runtime_factory=runtime_factory,
+    )
+    result = await service.incubate_project(
+        ProjectIncubationSpec(
+            project_name="Export Demo",
+            project_goal="Build a simple exportable frontend starter project.",
+            export_target_path=str(export_target),
+        )
+    )
+
+    internal_output = Path(result.output_dir)
+    assert internal_output.is_dir()
+    assert result.exported_output_dir == str(export_target)
+    assert export_target.is_dir()
+    assert (export_target / "README.md").read_text(encoding="utf-8") == "# Export Demo\n"
+    assert (export_target / "package.json").read_text(encoding="utf-8") == '{"name":"export-demo"}\n'
+    assert (internal_output / "README.md").read_text(encoding="utf-8") == "# Export Demo\n"
+
+    report = json.loads((internal_output / "_incubation_report.json").read_text(encoding="utf-8"))
+    assert report["exported_output_dir"] == str(export_target)
+
+
+@pytest.mark.asyncio
+async def test_incubation_waits_for_self_reflective_follow_up_chain(incubation_setup):
+    holon_id = "holon_follow_up_chain"
+    await _create_holon(holon_id)
+
+    execution_result = {
+        "project_name": "Cyber Ledger",
+        "project_slug": "cyber_ledger",
+        "files": {
+            "README.md": "# Cyber Ledger\n",
+            "package.json": '{"name":"cyber-ledger"}\n',
+            "index.html": "<html></html>\n",
+            "src/main.jsx": "export {};\n",
+            "src/app.jsx": "export default function App() { return null; }\n",
+            "src/styles.css": "body { background: #000; }\n",
+        },
+        "run_instructions": ["npm install", "npm run dev"],
+    }
+
+    class _FollowUpRuntime(_StubRuntime):
+        def __init__(self, holon_id, blueprint, execution_result):
+            super().__init__(holon_id, blueprint, execution_result)
+            self.wait_calls: list[str] = []
+
+        async def wait_for_evolution(self, request_id, timeout_seconds, poll_interval_seconds):
+            _ = (timeout_seconds, poll_interval_seconds)
+            self.wait_calls.append(request_id)
+            if request_id == "evo_stub_001":
+                return EvolutionRequest(
+                    request_id=request_id,
+                    holon_id=self.holon_id,
+                    skill_name="Autonomous Stub Builder",
+                    description="stub",
+                    requirements=[],
+                    test_cases=[],
+                    parent_skills=[],
+                    status=EvolutionStatus.FAILED,
+                    created_at=utc_now_iso(),
+                    completed_at=utc_now_iso(),
+                    result={
+                        "status": "failed",
+                        "follow_up": {
+                            "triggered": True,
+                            "request_id": "evo_stub_002",
+                        },
+                    },
+                    error_message="first attempt failed",
+                )
+            if request_id == "evo_stub_002":
+                return EvolutionRequest(
+                    request_id=request_id,
+                    holon_id=self.holon_id,
+                    skill_name="Autonomous Stub Builder",
+                    description="stub",
+                    requirements=[],
+                    test_cases=[],
+                    parent_skills=[],
+                    status=EvolutionStatus.COMPLETED,
+                    created_at=utc_now_iso(),
+                    completed_at=utc_now_iso(),
+                    result={"skill_id": "autonomous_stub_builder"},
+                )
+            raise AssertionError(f"unexpected request id: {request_id}")
+
+    async def fake_route_or_spawn(user_request, conversation_history=None):
+        return SimpleNamespace(
+            decision="route_to",
+            holon_id=holon_id,
+        )
+
+    genesis = SimpleNamespace(route_or_spawn=fake_route_or_spawn)
+    stub_runtime = _FollowUpRuntime(holon_id, None, execution_result)
+
+    def runtime_factory(runtime_holon_id, blueprint):
+        stub_runtime.blueprint = blueprint
+        return stub_runtime
+
+    service = ProjectIncubationService(
+        genesis_service=genesis,
+        runtime_factory=runtime_factory,
+    )
+    result = await service.incubate_project(
+        ProjectIncubationSpec(
+            project_name="Cyber Ledger",
+            project_goal="Build a cyberpunk bookkeeping frontend.",
+            required_files=[
+                "README.md",
+                "package.json",
+                "index.html",
+                "src/main.jsx",
+                "src/app.jsx",
+                "src/styles.css",
+            ],
+        )
+    )
+
+    assert stub_runtime.wait_calls == ["evo_stub_001", "evo_stub_002"]
+    assert result.request_id == "evo_stub_002"
+    assert result.evolution_status == EvolutionStatus.COMPLETED.value
+    assert result.generated_file_count == 6

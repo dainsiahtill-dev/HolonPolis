@@ -37,6 +37,10 @@ _EXPORTS = {
         "holonpolis.services.project_incubation_service",
         "ProjectIncubationResult",
     ),
+    "ProjectDeliveryService": (
+        "holonpolis.services.project_delivery_service",
+        "ProjectDeliveryService",
+    ),
     "ReusableProjectScaffoldService": (
         "holonpolis.services.reusable_project_scaffold_service",
         "ReusableProjectScaffoldService",

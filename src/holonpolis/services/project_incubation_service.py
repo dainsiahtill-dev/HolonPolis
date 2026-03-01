@@ -28,6 +28,7 @@ from holonpolis.runtime.holon_runtime import (
 )
 from holonpolis.services.genesis_service import GenesisService
 from holonpolis.services.holon_service import HolonService
+from holonpolis.services.project_delivery_service import ProjectDeliveryService
 from holonpolis.services.reusable_project_scaffold_service import (
     ReusableProjectScaffold,
     ReusableProjectScaffoldService,
@@ -48,7 +49,9 @@ class ProjectIncubationSpec:
     skill_name: Optional[str] = None
     execution_payload: Dict[str, Any] = field(default_factory=dict)
     required_files: List[str] = field(default_factory=list)
-    prefer_reusable_scaffold: bool = True
+    export_target_path: Optional[str] = None
+    replace_existing_export: bool = False
+    prefer_reusable_scaffold: bool = False
     allow_evolution_fallback: bool = True
     evolution_timeout_seconds: float = 360.0
     poll_interval_seconds: float = 0.5
@@ -72,6 +75,7 @@ class ProjectIncubationResult:
     delivery_mode: str = "evolved_skill"
     reused_library_key: str = ""
     run_instructions: List[str] = field(default_factory=list)
+    exported_output_dir: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -89,6 +93,7 @@ class ProjectIncubationResult:
             "delivery_mode": self.delivery_mode,
             "reused_library_key": self.reused_library_key,
             "run_instructions": list(self.run_instructions),
+            "exported_output_dir": self.exported_output_dir,
         }
 
 
@@ -101,6 +106,7 @@ class ProjectIncubationService:
         genesis_service: Optional[GenesisService] = None,
         runtime_factory: Optional[RuntimeFactory] = None,
         reusable_scaffold_service: Optional[ReusableProjectScaffoldService] = None,
+        delivery_service: Optional[ProjectDeliveryService] = None,
     ):
         self.holon_service = holon_service or HolonService()
         self.genesis_service = genesis_service or GenesisService()
@@ -108,6 +114,7 @@ class ProjectIncubationService:
         self.reusable_scaffold_service = reusable_scaffold_service or ReusableProjectScaffoldService(
             holon_service=self.holon_service
         )
+        self.delivery_service = delivery_service or ProjectDeliveryService()
 
     async def incubate_project(self, spec: ProjectIncubationSpec) -> ProjectIncubationResult:
         """Route/spawn via Genesis, evolve capability, execute skill, and materialize files."""
@@ -129,7 +136,7 @@ class ProjectIncubationService:
         reusable_assets = await self._search_reusable_assets(runtime, project_goal)
         project_slug = self._slugify(project_name)
 
-        if spec.prefer_reusable_scaffold:
+        if self._should_attempt_reusable_scaffold(spec):
             scaffold = self._try_materialize_reusable_scaffold(
                 holon_id=holon_id,
                 project_name=project_name,
@@ -144,6 +151,12 @@ class ProjectIncubationService:
                     route_decision=route_decision,
                     project_name=project_name,
                     scaffold=scaffold,
+                )
+                self._export_if_requested(
+                    holon_id=holon_id,
+                    output_dir=scaffold.output_dir,
+                    result=result,
+                    spec=spec,
                 )
                 self._write_incubation_report(scaffold.output_dir, result)
                 return result
@@ -162,7 +175,8 @@ class ProjectIncubationService:
             parent_skills=[],
         )
 
-        status = await runtime.wait_for_evolution(
+        status = await self._wait_for_terminal_evolution_chain(
+            runtime=runtime,
             request_id=request.request_id,
             timeout_seconds=spec.evolution_timeout_seconds,
             poll_interval_seconds=spec.poll_interval_seconds,
@@ -195,7 +209,7 @@ class ProjectIncubationService:
             route_decision=route_decision,
             project_name=project_name,
             project_slug=project_slug,
-            request_id=request.request_id,
+            request_id=status.request_id,
             evolution_status=status.status.value,
             skill_name=skill_name,
             skill_id=skill_id,
@@ -205,6 +219,12 @@ class ProjectIncubationService:
             delivery_mode="evolved_skill",
             reused_library_key="",
             run_instructions=self._extract_run_instructions(execution_result),
+        )
+        self._export_if_requested(
+            holon_id=holon_id,
+            output_dir=output_dir,
+            result=result,
+            spec=spec,
         )
         self._write_incubation_report(output_dir, result)
         return result
@@ -468,6 +488,53 @@ class ProjectIncubationService:
                 instructions.append(text)
         return instructions
 
+    @staticmethod
+    def _extract_follow_up_request_id(status: EvolutionRequest) -> str:
+        payload = status.result if isinstance(status.result, dict) else {}
+        follow_up = payload.get("follow_up")
+        if not isinstance(follow_up, dict):
+            return ""
+        if not bool(follow_up.get("triggered")):
+            return ""
+        return str(follow_up.get("request_id") or "").strip()
+
+    async def _wait_for_terminal_evolution_chain(
+        self,
+        *,
+        runtime: Any,
+        request_id: str,
+        timeout_seconds: float,
+        poll_interval_seconds: float,
+    ) -> EvolutionRequest:
+        """Follow self-reflective continuation requests until the chain reaches a real terminal state."""
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        current_request_id = str(request_id or "").strip()
+        seen_request_ids: set[str] = set()
+
+        while True:
+            if not current_request_id:
+                raise ValueError("request_id must be a non-empty string")
+            if current_request_id in seen_request_ids:
+                raise RuntimeError(f"Evolution follow-up loop detected for request {current_request_id}")
+            seen_request_ids.add(current_request_id)
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"Timed out waiting for evolution chain starting at {request_id} "
+                    f"after {float(timeout_seconds):.1f}s"
+                )
+
+            status = await runtime.wait_for_evolution(
+                request_id=current_request_id,
+                timeout_seconds=remaining,
+                poll_interval_seconds=poll_interval_seconds,
+            )
+            follow_up_request_id = self._extract_follow_up_request_id(status)
+            if status.status == EvolutionStatus.COMPLETED or not follow_up_request_id:
+                return status
+            current_request_id = follow_up_request_id
+
     def _materialize_files(self, holon_id: str, project_slug: str, files: Dict[str, str]) -> Path:
         guard = HolonPathGuard(holon_id)
         run_suffix = f"{int(time.time())}_{uuid.uuid4().hex[:6]}"
@@ -486,6 +553,30 @@ class ProjectIncubationService:
             str(report_path),
             json.dumps(result.to_dict(), ensure_ascii=False, indent=2) + "\n",
         )
+
+    @staticmethod
+    def _should_attempt_reusable_scaffold(spec: ProjectIncubationSpec) -> bool:
+        """Reusable scaffold delivery is an explicit opt-in; user requirements default to evolution."""
+        return bool(spec.prefer_reusable_scaffold)
+
+    def _export_if_requested(
+        self,
+        *,
+        holon_id: str,
+        output_dir: Path,
+        result: ProjectIncubationResult,
+        spec: ProjectIncubationSpec,
+    ) -> None:
+        export_target_path = str(spec.export_target_path or "").strip()
+        if not export_target_path:
+            return
+        exported_dir = self.delivery_service.export_project(
+            holon_id=holon_id,
+            source_dir=output_dir,
+            target_dir=export_target_path,
+            replace_existing=bool(spec.replace_existing_export),
+        )
+        result.exported_output_dir = str(exported_dir)
 
     def _normalize_generated_rel_path(self, rel_path: Any) -> str:
         raw = str(rel_path or "").strip().replace("\\", "/")

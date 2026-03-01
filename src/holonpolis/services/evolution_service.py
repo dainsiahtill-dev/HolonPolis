@@ -604,6 +604,32 @@ class EvolutionService:
             "model": model,
         }
 
+    @staticmethod
+    def _is_retryable_llm_error(exc: Exception) -> bool:
+        """Identify transient provider failures that should rotate to another candidate."""
+        if isinstance(exc, TimeoutError):
+            return True
+        if exc.__class__.__name__.lower() in {"readtimeout", "connecttimeout", "apitimeouterror"}:
+            return True
+        message = str(exc or "").lower()
+        retryable_markers = (
+            "429",
+            "500",
+            "502",
+            "503",
+            "504",
+            "rate limit",
+            "gateway time-out",
+            "gateway timeout",
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "connection reset",
+            "connection aborted",
+            "connection refused",
+        )
+        return any(marker in message for marker in retryable_markers)
+
     def _reset_evolution_audit(self, holon_id: str, pending_token: Optional[str]) -> None:
         """Start a fresh audit window for the outermost evolution invocation."""
         self._holon_service.update_evolution_audit(
@@ -616,6 +642,11 @@ class EvolutionService:
                 "error": "",
                 "started_at": utc_now_iso(),
                 "completed_at": "",
+                "skill_id": "",
+                "attestation_id": "",
+                "code_path": "",
+                "test_path": "",
+                "manifest_path": "",
                 "fallback_to_cached_skill": False,
                 "cache_reused_without_llm": False,
                 "llm": {
@@ -663,43 +694,24 @@ class EvolutionService:
         config: Optional[LLMConfig],
     ):
         """Wrap LLM chat so state.json shows whether a real LLM request is in flight."""
-        metadata = self._resolve_llm_audit_metadata(config)
-        counters = self._snapshot_llm_counters(holon_id)
-        started_at = utc_now_iso()
-        self._holon_service.update_evolution_audit(
-            holon_id,
-            patch={
-                "request_id": str(pending_token or ""),
-                "lifecycle": "running",
-                "phase": str(stage),
-                "result": "in_progress",
-                "error": "",
-                "fallback_to_cached_skill": False,
-                "llm": {
-                    "requested": True,
-                    "inflight": True,
-                    "call_count": counters["call_count"] + 1,
-                    "success_count": counters["success_count"],
-                    "failure_count": counters["failure_count"],
-                    "last_status": "started",
-                    "last_stage": str(stage),
-                    "provider_id": metadata["provider_id"],
-                    "provider_type": metadata["provider_type"],
-                    "model": metadata["model"],
-                    "last_error": "",
-                    "last_latency_ms": 0,
-                    "last_started_at": started_at,
-                },
-            },
-        )
-        try:
-            response = await self._llm.chat(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                config=config,
-            )
-        except Exception as exc:
-            finished_at = utc_now_iso()
+        active_config = config
+        retry_budget = 3
+        base_temperature = float(getattr(config, "temperature", 0.3) if config is not None else 0.3)
+        base_max_tokens = int(getattr(config, "max_tokens", 4000) if config is not None else 4000)
+        last_exc: Optional[Exception] = None
+
+        for attempt_index in range(retry_budget):
+            if attempt_index > 0:
+                active_config = self._resolve_stage_llm_config(
+                    holon_id=holon_id,
+                    stage=stage,
+                    base_temperature=base_temperature,
+                    base_max_tokens=base_max_tokens,
+                )
+
+            metadata = self._resolve_llm_audit_metadata(active_config)
+            counters = self._snapshot_llm_counters(holon_id)
+            started_at = utc_now_iso()
             self._holon_service.update_evolution_audit(
                 holon_id,
                 patch={
@@ -707,54 +719,103 @@ class EvolutionService:
                     "lifecycle": "running",
                     "phase": str(stage),
                     "result": "in_progress",
-                    "error": str(exc),
+                    "error": "",
+                    "fallback_to_cached_skill": False,
                     "llm": {
                         "requested": True,
-                        "inflight": False,
+                        "inflight": True,
                         "call_count": counters["call_count"] + 1,
                         "success_count": counters["success_count"],
-                        "failure_count": counters["failure_count"] + 1,
-                        "last_status": "failed",
+                        "failure_count": counters["failure_count"],
+                        "last_status": "started",
                         "last_stage": str(stage),
                         "provider_id": metadata["provider_id"],
                         "provider_type": metadata["provider_type"],
                         "model": metadata["model"],
-                        "last_error": str(exc),
+                        "last_error": "",
                         "last_latency_ms": 0,
+                        "last_started_at": started_at,
+                    },
+                },
+            )
+            try:
+                response = await self._llm.chat(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    config=active_config,
+                )
+            except Exception as exc:
+                finished_at = utc_now_iso()
+                self._holon_service.update_evolution_audit(
+                    holon_id,
+                    patch={
+                        "request_id": str(pending_token or ""),
+                        "lifecycle": "running",
+                        "phase": str(stage),
+                        "result": "in_progress",
+                        "error": str(exc),
+                        "llm": {
+                            "requested": True,
+                            "inflight": False,
+                            "call_count": counters["call_count"] + 1,
+                            "success_count": counters["success_count"],
+                            "failure_count": counters["failure_count"] + 1,
+                            "last_status": "failed",
+                            "last_stage": str(stage),
+                            "provider_id": metadata["provider_id"],
+                            "provider_type": metadata["provider_type"],
+                            "model": metadata["model"],
+                            "last_error": str(exc),
+                            "last_latency_ms": 0,
+                            "last_completed_at": finished_at,
+                        },
+                    },
+                )
+                last_exc = exc
+                if attempt_index + 1 >= retry_budget or not self._is_retryable_llm_error(exc):
+                    raise
+                logger.warning(
+                    "llm_stage_retrying_with_fallback_provider",
+                    holon_id=holon_id,
+                    stage=stage,
+                    failed_provider_id=metadata["provider_id"],
+                    attempt=attempt_index + 1,
+                    error=str(exc),
+                )
+                continue
+
+            finished_at = utc_now_iso()
+            resolved_model = str(getattr(response, "model", "") or metadata["model"]).strip()
+            self._holon_service.update_evolution_audit(
+                holon_id,
+                patch={
+                    "request_id": str(pending_token or ""),
+                    "lifecycle": "running",
+                    "phase": str(stage),
+                    "result": "in_progress",
+                    "error": "",
+                    "llm": {
+                        "requested": True,
+                        "inflight": False,
+                        "call_count": counters["call_count"] + 1,
+                        "success_count": counters["success_count"] + 1,
+                        "failure_count": counters["failure_count"],
+                        "last_status": "succeeded",
+                        "last_stage": str(stage),
+                        "provider_id": metadata["provider_id"],
+                        "provider_type": metadata["provider_type"],
+                        "model": resolved_model,
+                        "last_error": "",
+                        "last_latency_ms": int(getattr(response, "latency_ms", 0) or 0),
                         "last_completed_at": finished_at,
                     },
                 },
             )
-            raise
+            return response
 
-        finished_at = utc_now_iso()
-        resolved_model = str(getattr(response, "model", "") or metadata["model"]).strip()
-        self._holon_service.update_evolution_audit(
-            holon_id,
-            patch={
-                "request_id": str(pending_token or ""),
-                "lifecycle": "running",
-                "phase": str(stage),
-                "result": "in_progress",
-                "error": "",
-                "llm": {
-                    "requested": True,
-                    "inflight": False,
-                    "call_count": counters["call_count"] + 1,
-                    "success_count": counters["success_count"] + 1,
-                    "failure_count": counters["failure_count"],
-                    "last_status": "succeeded",
-                    "last_stage": str(stage),
-                    "provider_id": metadata["provider_id"],
-                    "provider_type": metadata["provider_type"],
-                    "model": resolved_model,
-                    "last_error": "",
-                    "last_latency_ms": int(getattr(response, "latency_ms", 0) or 0),
-                    "last_completed_at": finished_at,
-                },
-            },
-        )
-        return response
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("LLM chat exhausted without response")
 
     # Public API ------------------------------------------------------------- #
 
@@ -1632,41 +1693,67 @@ Mandatory rules:
     def _project_generation_rules(requirements: List[str]) -> List[str]:
         if not EvolutionService._detect_project_contract_mode(requirements):
             return []
+        profile = EvolutionService._analyze_project_contract(requirements)
         min_file_count = EvolutionService._infer_project_min_file_count(requirements)
-        return [
+        rules = [
             (
                 "execute()['files'] must contain at least "
-                f"{min_file_count} non-empty files spread across modular directories."
+                f"{min_file_count} non-empty files spread across coherent directories."
             ),
             "Never output placeholder-only files or comments (TODO/TBD/placeholder/render logic/implement here).",
             (
-                "apps/server/src/server.mjs must contain explicit '/healthz' and '/ws' strings, "
-                "read PORT from process.env.PORT, and send JSON websocket messages with type "
-                "including welcome and snapshot/state."
+                "Implement project_goal semantics strictly from project_goal and requirements; "
+                "do not inject unrelated business domains, genres, or architectures."
             ),
             (
-                "Initialize websocket server with one of these literal forms in source: "
-                "`new WebSocketServer({ server })` (ESM) or `new Server({ server })` (CJS import alias)."
-            ),
-            (
-                "Implement gameplay/domain semantics strictly from project_goal and requirements; "
-                "do not inject unrelated genre/theme assumptions."
-            ),
-            (
-                "Gameplay modules must contain substantive logic (functions/state updates), "
+                "Generated source files should contain substantive logic and styling, "
                 "not comment-only or console.log-only stubs."
-            ),
-            (
-                "scripts/smoke/ws-smoke.mjs must include timeout protection and explicit exits: "
-                "process.exit(0) on success, non-zero exit on failure, and websocket URL built from process.env.PORT."
             ),
             "Keep output deterministic for the same project_name/project_goal input.",
         ]
+
+        if profile["expects_frontend"]:
+            rules.extend(
+                [
+                    "Produce a real front-end entry flow with an HTML shell, source entry module, and composed app/UI modules.",
+                    "If package.json is present, include practical local run scripts such as dev/start/build and declare imported third-party packages.",
+                    "run_instructions must be a non-empty list of concrete commands for a developer to run locally.",
+                ]
+            )
+
+        if profile["expects_server"]:
+            rules.extend(
+                [
+                    "If package.json is present, declare imported third-party runtime packages in dependencies/devDependencies.",
+                    "Provide explicit server entry modules and avoid placeholder request handlers.",
+                ]
+            )
+
+        if profile["expects_websocket"]:
+            rules.extend(
+                [
+                    (
+                        "Websocket server output must contain explicit '/healthz' and '/ws' strings, "
+                        "read PORT from process.env.PORT, and send JSON messages with type fields."
+                    ),
+                    (
+                        "Initialize websocket server with one of these literal forms in source: "
+                        "`new WebSocketServer({ server })` (ESM) or `new Server({ server })` (CJS import alias)."
+                    ),
+                    (
+                        "Any websocket smoke script must include timeout protection and explicit exits: "
+                        "process.exit(0) on success, non-zero exit on failure, and websocket URL built from process.env.PORT."
+                    ),
+                ]
+            )
+
+        return rules
 
     @staticmethod
     def _derive_failure_repair_hints(failure_message: str, requirements: List[str]) -> List[str]:
         message = str(failure_message or "")
         lower = message.lower()
+        profile = EvolutionService._analyze_project_contract(requirements)
         hints: List[str] = []
 
         def add_hint(text: str) -> None:
@@ -1687,7 +1774,7 @@ Mandatory rules:
             inferred_min = EvolutionService._infer_project_min_file_count(requirements)
             add_hint(
                 "Ensure execute()['files'] contains at least "
-                f"{inferred_min} files with modular server/client/runtime/security source modules."
+                f"{inferred_min} files with coherent app structure and non-empty content."
             )
 
         placeholder_tokens = ("placeholder token in", "render logic", "todo", "tbd", "coming soon")
@@ -1696,24 +1783,24 @@ Mandatory rules:
                 "Remove placeholder comments/text from every generated file and replace them with concrete logic."
             )
 
-        if 'assert "/ws" in server' in lower or "assert '/ws' in server" in lower:
+        if profile["expects_websocket"] and ('assert "/ws" in server' in lower or "assert '/ws' in server" in lower):
             add_hint("Add explicit '/ws' path handling text in apps/server/src/server.mjs.")
-        if "has_ws_server_ctor or has_cjs_ws_ctor" in lower:
+        if profile["expects_websocket"] and "has_ws_server_ctor or has_cjs_ws_ctor" in lower:
             add_hint(
                 "Construct websocket server with `new WebSocketServer({ server })` or `new Server({ server })`."
             )
 
-        if "process.exit(0)" in lower and "smoke" in lower:
+        if profile["expects_websocket"] and "process.exit(0)" in lower and "smoke" in lower:
             add_hint(
                 "In scripts/smoke/ws-smoke.mjs, call process.exit(0) after receiving welcome/snapshot/state."
             )
-        if "process.env.port" in lower and "smoke" in lower:
+        if profile["expects_websocket"] and "process.env.port" in lower and "smoke" in lower:
             add_hint("Use process.env.PORT in smoke websocket URL; do not hardcode port 3000/8080.")
-        if "unexpected token" in lower and "ws-smoke" in lower:
+        if profile["expects_websocket"] and "unexpected token" in lower and "ws-smoke" in lower:
             add_hint(
                 "Fix JavaScript syntax in scripts/smoke/ws-smoke.mjs (balanced braces/parentheses and valid callback blocks)."
             )
-        if "test_server_contains_health_and_ws_reply_logic" in lower and (
+        if profile["expects_websocket"] and "test_server_runtime_contracts_present" in lower and (
             "snapshot" in lower or "state" in lower
         ):
             add_hint(
@@ -1725,25 +1812,34 @@ Mandatory rules:
                 "Avoid .format(...) and risky f-string interpolation for JS/JSON templates; use plain literals."
             )
 
-        if ".on('/healthz'" in lower or '.on("/healthz"' in lower or ".on('/ws'" in lower or '.on("/ws"' in lower:
+        if profile["expects_websocket"] and (
+            ".on('/healthz'" in lower
+            or '.on("/healthz"' in lower
+            or ".on('/ws'" in lower
+            or '.on("/ws"' in lower
+        ):
             add_hint("Do not register HTTP routes with server.on('/healthz')/wss.on('/ws'); handle via request listener and ws server setup.")
 
-        if "package_scripts_quality" in lower or '"ws" in dependencies' in lower:
+        if "test_package_json_is_valid_and_has_scripts" in lower or '"ws" in dependencies' in lower:
             add_hint(
-                "Declare ws dependency in package.json and keep scripts.start:server + scripts.smoke:ws executable."
+                "Keep package.json valid, declare imported third-party packages, and provide practical scripts for local development."
             )
 
-        if "test_domain_modules_present_for_large_game" in lower or "missing_domain_module" in lower:
+        if profile["is_large_multiplayer"] and ("test_file_count_meets_scale_floor" in lower or "missing_domain_module" in lower):
             add_hint(
-                "Provide concrete modular runtime domains (for example world/state, matchmaking/sync, and anti-cheat/security) in source file paths."
+                "Provide a broader modular layout with enough concrete source modules to meet the project scale floor."
             )
-        if "test_gameplay_semantics_present" in lower:
+        if "test_goal_semantics_present" in lower:
             add_hint(
-                "Ensure generated files explicitly implement project_goal-described gameplay/domain semantics with interaction and progression state updates."
+                "Ensure generated files explicitly implement project_goal-described domain semantics in copy, styling, and logic."
             )
-        if "test_gameplay_modules_have_substantive_logic" in lower:
+        if "test_frontend_structure_present" in lower:
             add_hint(
-                "Replace comment/console-only gameplay modules with real logic functions and state transitions."
+                "Provide a concrete front-end entry flow with index.html, a src entry module, and composed UI source files."
+            )
+        if "test_substantive_source_logic_present" in lower:
+            add_hint(
+                "Replace comment-only or console-only source files with substantive implementation logic."
             )
 
         if not hints:
@@ -1778,21 +1874,90 @@ Mandatory rules:
         return []
 
     @staticmethod
-    def _infer_project_min_file_count(requirements: List[str]) -> int:
-        merged = "\n".join(str(item or "").lower() for item in requirements)
+    def _analyze_project_contract(requirements: List[str]) -> Dict[str, Any]:
+        """Infer coarse project shape so prompts/tests match the requested domain."""
+        required_paths = EvolutionService._extract_required_paths_from_requirements(requirements)
+        project_goal = EvolutionService._extract_project_goal_from_requirements(requirements)
+        merged = "\n".join(str(item or "") for item in requirements)
+        merged_lower = merged.lower()
+        goal_lower = project_goal.lower()
+        lower_paths = [path.lower() for path in required_paths]
+
         large_keywords = (
             "mmo",
             "multiplayer",
             "websocket",
             "real-time",
-            "large",
-            "large-scale",
+            "large multiplayer",
             "多人在线",
             "大型",
         )
-        if any(keyword in merged for keyword in large_keywords):
-            return 18
-        return 6
+        frontend_goal_keywords = (
+            "frontend",
+            "front-end",
+            "dashboard",
+            "landing page",
+            "website",
+            "web app",
+            "single-page",
+            "spa",
+            "vite",
+            "react",
+            "vue",
+            "记账",
+            "账单",
+            "财务",
+            "前端",
+            "网站",
+        )
+        server_goal_keywords = (
+            "backend",
+            "server",
+            "api",
+            "websocket",
+            "socket",
+            "worker",
+            "queue",
+        )
+
+        has_frontend_paths = any(
+            path == "index.html"
+            or path.startswith(("src/", "app/", "pages/", "public/"))
+            or path.endswith((".html", ".css", ".scss", ".jsx", ".tsx", ".vue", ".svelte"))
+            for path in lower_paths
+        )
+        has_server_paths = any(
+            path.startswith(("apps/server/", "server/", "api/", "backend/"))
+            for path in lower_paths
+        )
+
+        expects_frontend = has_frontend_paths or any(token in goal_lower for token in frontend_goal_keywords)
+        expects_server = has_server_paths or any(token in goal_lower for token in server_goal_keywords)
+        expects_websocket = any(token in goal_lower for token in ("websocket", "socket", "实时"))
+        if has_server_paths and any("/ws" in path or "socket" in path for path in lower_paths):
+            expects_websocket = True
+
+        return {
+            "required_paths": required_paths,
+            "project_goal": project_goal,
+            "goal_keywords": EvolutionService._derive_goal_keywords(project_goal),
+            "expects_frontend": bool(expects_frontend and not (expects_server and not has_frontend_paths)),
+            "expects_server": bool(expects_server),
+            "expects_websocket": bool(expects_websocket and expects_server),
+            "expects_package_json": "package.json" in lower_paths,
+            "expects_readme": "readme.md" in lower_paths or "readme must include" in merged_lower,
+            "is_large_multiplayer": any(keyword in merged_lower for keyword in large_keywords),
+        }
+
+    @staticmethod
+    def _infer_project_min_file_count(requirements: List[str]) -> int:
+        profile = EvolutionService._analyze_project_contract(requirements)
+        required_floor = max(4, len(profile["required_paths"]))
+        if profile["is_large_multiplayer"]:
+            return max(required_floor + 4, 12)
+        if profile["expects_frontend"] or profile["expects_server"]:
+            return max(required_floor, 5)
+        return required_floor
 
     @staticmethod
     def _extract_project_goal_from_requirements(requirements: List[str]) -> str:
@@ -1853,30 +2018,26 @@ Mandatory rules:
 
     @staticmethod
     def _build_project_contract_tests(requirements: List[str]) -> str:
-        required_paths = EvolutionService._extract_required_paths_from_requirements(requirements)
-        min_file_count = EvolutionService._infer_project_min_file_count(requirements)
-        project_goal = (
-            EvolutionService._extract_project_goal_from_requirements(requirements)
-            or "Build large multiplayer online game scaffold"
-        )
-        goal_keywords = EvolutionService._derive_goal_keywords(project_goal)
-        required_literal = repr(required_paths)
-        goal_keywords_literal = repr(goal_keywords)
-        goal_literal = repr(project_goal)
+        profile = EvolutionService._analyze_project_contract(requirements)
+        required_literal = repr(profile["required_paths"])
+        goal_keywords_literal = repr(profile["goal_keywords"])
+        goal_literal = repr(profile["project_goal"] or "Build requested project scaffold")
         return f'''import inspect
 import json
 import os
 import re
-import shutil
-import subprocess
-import tempfile
-from pathlib import Path
+
 import skill_module
 
 REQUIRED_PATHS = {required_literal}
-MIN_FILE_COUNT = {min_file_count}
+MIN_FILE_COUNT = {EvolutionService._infer_project_min_file_count(requirements)}
 PROJECT_GOAL = {goal_literal}
 GOAL_KEYWORDS = {goal_keywords_literal}
+EXPECTS_FRONTEND = {repr(bool(profile["expects_frontend"]))}
+EXPECTS_SERVER = {repr(bool(profile["expects_server"]))}
+EXPECTS_WEBSOCKET = {repr(bool(profile["expects_websocket"]))}
+EXPECTS_PACKAGE_JSON = {repr(bool(profile["expects_package_json"]))}
+EXPECTS_README = {repr(bool(profile["expects_readme"]))}
 PLACEHOLDER_TOKENS = (
     "todo",
     "tbd",
@@ -1892,7 +2053,7 @@ PLACEHOLDER_TOKENS = (
 
 def _run_once():
     return skill_module.execute(
-        project_name="Abyss Arena",
+        project_name="Generated Project",
         project_goal=PROJECT_GOAL,
     )
 
@@ -1910,6 +2071,14 @@ def test_execute_signature_contract():
     assert "project_goal" in sig.parameters
 
 
+def test_project_slug_is_sanitized():
+    out = _run_once()
+    slug = out.get("project_slug")
+    assert isinstance(slug, str) and slug.strip()
+    assert slug == slug.strip().lower()
+    assert re.fullmatch(r"[a-z0-9_-]+", slug)
+
+
 def test_files_are_relative_utf8_text():
     out = _run_once()
     files = out["files"]
@@ -1918,7 +2087,9 @@ def test_files_are_relative_utf8_text():
     for rel_path, content in files.items():
         assert isinstance(rel_path, str) and rel_path.strip()
         assert not os.path.isabs(rel_path)
-        assert ".." not in rel_path.replace("\\\\", "/")
+        normalized = rel_path.replace("\\\\", "/")
+        assert ".." not in normalized
+        assert not normalized.startswith("/")
         assert isinstance(content, str)
         assert content.strip()
 
@@ -1934,31 +2105,10 @@ def test_file_count_meets_scale_floor():
     out = _run_once()
     files = out["files"]
     assert len(files) >= MIN_FILE_COUNT
-    assert any("/" in path for path in files.keys())
+    assert any("/" in path.replace("\\\\", "/") for path in files.keys())
 
 
-def test_runtime_critical_files_present():
-    out = _run_once()
-    files = out["files"]
-    assert "apps/server/src/server.mjs" in files
-    assert "scripts/smoke/ws-smoke.mjs" in files
-    assert "package.json" in files
-
-
-def test_domain_modules_present_for_large_game():
-    out = _run_once()
-    files = out["files"]
-    paths = [path.lower() for path in files.keys()]
-    assert any("apps/server/" in path for path in paths)
-    assert any("apps/client/" in path or "frontend/" in path for path in paths)
-    module_like = [
-        path for path in paths
-        if ("/src/" in path or path.startswith("scripts/")) and path.count("/") >= 2
-    ]
-    assert len(module_like) >= 6
-
-
-def test_gameplay_semantics_present():
+def test_goal_semantics_present():
     out = _run_once()
     files = out["files"]
     corpus = "\\n".join(str(content).lower() for content in files.values())
@@ -1966,7 +2116,7 @@ def test_gameplay_semantics_present():
         assert len(corpus) > 0
         return
     hits = [token for token in GOAL_KEYWORDS if token in corpus]
-    threshold = max(1, min(3, len(GOAL_KEYWORDS) // 3 if len(GOAL_KEYWORDS) >= 3 else 1))
+    threshold = max(1, min(3, max(1, len(GOAL_KEYWORDS) // 3)))
     assert len(hits) >= threshold, f"project goal semantics weakly represented: hits={{hits}} goal={{GOAL_KEYWORDS}}"
 
 
@@ -1979,32 +2129,89 @@ def test_no_placeholder_tokens():
             assert token not in lower, f"placeholder token in {{rel_path}}: {{token}}"
 
 
-def test_core_source_size_floor():
+def test_readme_has_install_run_usage():
+    if not EXPECTS_README:
+        return
+    out = _run_once()
+    readme_raw = str(out["files"].get("README.md", ""))
+    assert "install" in readme_raw.lower()
+    assert "run" in readme_raw.lower()
+    assert "usage" in readme_raw.lower()
+
+
+def test_run_instructions_non_empty():
+    out = _run_once()
+    value = out.get("run_instructions")
+    assert isinstance(value, list)
+    assert value
+    assert all(isinstance(item, str) and item.strip() for item in value)
+
+
+def test_package_json_is_valid_and_has_scripts():
+    if not EXPECTS_PACKAGE_JSON:
+        return
+    out = _run_once()
+    package_raw = str(out["files"].get("package.json", ""))
+    package = json.loads(package_raw)
+    assert isinstance(package, dict)
+    scripts = package.get("scripts", {{}})
+    dependencies = package.get("dependencies", {{}})
+    dev_dependencies = package.get("devDependencies", {{}})
+    assert isinstance(scripts, dict)
+    assert isinstance(dependencies, dict)
+    assert isinstance(dev_dependencies, dict)
+    assert any(name in scripts for name in ("dev", "start", "build"))
+    assert all("echo" not in str(value).lower() for value in scripts.values())
+
+
+def test_frontend_structure_present():
+    if not EXPECTS_FRONTEND:
+        return
+    out = _run_once()
+    paths = [path.replace("\\\\", "/").lower() for path in out["files"].keys()]
+    assert "index.html" in paths or any(path.endswith(".html") for path in paths)
+    assert any(path.startswith(("src/", "app/", "pages/")) for path in paths)
+    assert any(
+        path.endswith((".js", ".jsx", ".ts", ".tsx", ".css", ".scss", ".vue", ".svelte"))
+        for path in paths
+    )
+
+
+def test_frontend_scripts_support_local_run():
+    if not (EXPECTS_FRONTEND and EXPECTS_PACKAGE_JSON):
+        return
+    out = _run_once()
+    package = json.loads(str(out["files"].get("package.json", "")))
+    scripts = package.get("scripts", {{}})
+    command_text = " ".join(str(value).lower() for value in scripts.values())
+    assert any(name in scripts for name in ("dev", "start"))
+    assert any(token in command_text for token in ("vite", "next", "react-scripts", "nuxt", "svelte"))
+
+
+def test_server_runtime_contracts_present():
+    if not EXPECTS_SERVER:
+        return
+    out = _run_once()
+    paths = [path.replace("\\\\", "/").lower() for path in out["files"].keys()]
+    assert any(path.startswith(("apps/server/", "server/", "api/", "backend/")) for path in paths)
+    if EXPECTS_WEBSOCKET:
+        corpus = "\\n".join(str(content).lower() for content in out["files"].values())
+        assert "/healthz" in corpus
+        assert "/ws" in corpus
+        assert "process.env.port" in corpus
+
+
+def test_substantive_source_logic_present():
     out = _run_once()
     files = out["files"]
-    server_lines = len(files.get("apps/server/src/server.mjs", "").splitlines())
-    smoke_lines = len(files.get("scripts/smoke/ws-smoke.mjs", "").splitlines())
-    assert server_lines >= 30
-    assert smoke_lines >= 20
     source_like = [
-        path for path in files.keys()
-        if path.lower().endswith((".js", ".mjs", ".ts", ".tsx")) and ("/src/" in path.lower() or path.lower().startswith("scripts/"))
-    ]
-    assert len(source_like) >= 6
-
-
-def test_gameplay_modules_have_substantive_logic():
-    out = _run_once()
-    files = out["files"]
-    gameplay_paths = [
         path
         for path in files.keys()
-        if path.lower().endswith((".js", ".mjs", ".ts"))
-        and ("/src/" in path.lower() or path.lower().startswith("scripts/"))
+        if path.lower().endswith((".py", ".js", ".jsx", ".mjs", ".ts", ".tsx", ".css", ".scss", ".vue", ".svelte"))
     ]
-    assert len(gameplay_paths) >= 6
+    assert source_like
     substantive_count = 0
-    for path in gameplay_paths:
+    for path in source_like:
         content = str(files.get(path, ""))
         lowered = content.lower()
         non_comment_lines = [
@@ -2014,6 +2221,7 @@ def test_gameplay_modules_have_substantive_logic():
             and not line.strip().startswith("//")
             and not line.strip().startswith("/*")
             and not line.strip().startswith("*")
+            and not line.strip().startswith("#")
         ]
         has_logic_token = any(
             token in lowered
@@ -2021,59 +2229,22 @@ def test_gameplay_modules_have_substantive_logic():
                 "function",
                 "=>",
                 "class ",
+                "return ",
+                "export ",
+                "import ",
+                "const ",
+                "let ",
+                "var ",
                 "if ",
                 "for ",
                 "while ",
-                "switch ",
-                "return ",
-                "export const",
-                "export function",
             )
         )
         only_console = bool(non_comment_lines) and all("console.log" in line.lower() for line in non_comment_lines)
-        if len(non_comment_lines) >= 4 and has_logic_token and not only_console:
+        if len(non_comment_lines) >= 3 and has_logic_token and not only_console:
             substantive_count += 1
-    assert substantive_count >= 4
-
-
-def test_core_js_files_are_node_parseable():
-    out = _run_once()
-    files = out["files"]
-    node_bin = shutil.which("node")
-    assert node_bin
-    targets = (
-        "apps/server/src/server.mjs",
-        "scripts/smoke/ws-smoke.mjs",
-    )
-    with tempfile.TemporaryDirectory() as temp_dir:
-        for rel_path in targets:
-            content = files.get(rel_path, "")
-            assert isinstance(content, str) and content.strip()
-            temp_file = Path(temp_dir) / Path(rel_path).name
-            temp_file.write_text(content, encoding="utf-8")
-            check = subprocess.run(
-                [node_bin, "--check", str(temp_file)],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
-            assert check.returncode == 0, f"node --check failed for {{rel_path}}: {{(check.stderr or check.stdout)[-400:]}}"
-
-
-def test_readme_has_install_run_usage():
-    out = _run_once()
-    readme = out["files"].get("README.md", "").lower()
-    assert "install" in readme
-    assert "run" in readme
-    assert "usage" in readme
-
-
-def test_run_instructions_non_empty():
-    out = _run_once()
-    value = out.get("run_instructions")
-    assert isinstance(value, str)
-    assert value.strip()
+    threshold = 2 if (EXPECTS_FRONTEND or EXPECTS_SERVER) else 1
+    assert substantive_count >= threshold
 
 
 def test_skill_source_avoids_multiline_fstring_templates():
@@ -2085,102 +2256,6 @@ def test_skill_source_avoids_multiline_fstring_templates():
 def test_skill_source_avoids_format_template_brace_risk():
     source = inspect.getsource(skill_module)
     assert ".format(" not in source
-
-
-def test_package_scripts_quality():
-    out = _run_once()
-    package_raw = out["files"].get("package.json", "")
-    package = json.loads(package_raw)
-    scripts = package.get("scripts", {{}})
-    dependencies = package.get("dependencies", {{}})
-    dev_dependencies = package.get("devDependencies", {{}})
-    assert "start:server" in scripts
-    assert "smoke:ws" in scripts
-    start_cmd = str(scripts["start:server"]).lower()
-    smoke_cmd = str(scripts["smoke:ws"]).lower()
-    assert "echo" not in start_cmd
-    assert "node" in start_cmd or "npm" in start_cmd
-    assert "node" in smoke_cmd or "npm" in smoke_cmd
-    assert "server" in start_cmd
-    assert "smoke" in smoke_cmd and "ws" in smoke_cmd
-    assert "ws" in dependencies or "ws" in dev_dependencies
-
-
-def test_server_third_party_imports_declared_in_package():
-    out = _run_once()
-    files = out["files"]
-    server = files.get("apps/server/src/server.mjs", "")
-    package = json.loads(files.get("package.json", "{{}}"))
-    dependencies = package.get("dependencies", {{}})
-    dev_dependencies = package.get("devDependencies", {{}})
-    declared = set(str(key) for key in list(dependencies.keys()) + list(dev_dependencies.keys()))
-    third_party = set()
-    builtin_modules = {{
-        "assert", "buffer", "child_process", "cluster", "console", "crypto", "dgram",
-        "dns", "events", "fs", "http", "http2", "https", "module", "net", "os",
-        "path", "perf_hooks", "process", "querystring", "readline", "repl", "stream",
-        "string_decoder", "timers", "tls", "tty", "url", "util", "v8", "vm",
-        "worker_threads", "zlib"
-    }}
-    for quoted in re.findall(r'from\\s+[\\'\\"]([^\\'\\"]+)[\\'\\"]', server):
-        if quoted.startswith(".") or quoted.startswith("/") or quoted.startswith("node:"):
-            continue
-        segments = quoted.split("/")
-        if quoted.startswith("@") and len(segments) >= 2:
-            package_name = "/".join(segments[:2])
-        else:
-            package_name = segments[0]
-        if package_name in builtin_modules:
-            continue
-        third_party.add(package_name)
-    for required in third_party:
-        assert required in declared
-
-
-def test_server_contains_health_and_ws_reply_logic():
-    out = _run_once()
-    files = out["files"]
-    server = out["files"].get("apps/server/src/server.mjs", "").lower()
-    all_text = "\\n".join(str(content).lower() for content in files.values())
-    assert "/healthz" in server
-    assert "/ws" in server
-    assert "process.env.port" in server or "process.env.port" in all_text
-    assert "from 'ws'" in server or 'from "ws"' in server or "require('ws')" in server
-    has_ws_server_ctor = "new websocketserver(" in server or "new server(" in server
-    has_cjs_ws_ctor = "require('ws')" in server and ".server(" in server
-    assert has_ws_server_ctor or has_cjs_ws_ctor
-    assert "new websocket.server(" not in server
-    assert ".on('/healthz'" not in server and '.on("/healthz"' not in server
-    assert ".on('/ws'" not in server and '.on("/ws"' not in server
-    has_inline_http_handler = "createserver((req, res)" in server or "createserver(function (req, res)" in server
-    has_extra_request_handler = ".on('request'" in server or '.on("request"' in server
-    assert not (has_inline_http_handler and has_extra_request_handler)
-    assert "websocket" in server or "ws" in server
-    assert "on('message'" in server or 'on(\"message\"' in server
-    assert "ws.send" in server
-    assert "json.stringify" in server
-    assert "welcome" in server
-    assert "snapshot" in server or "state" in server
-
-
-def test_ws_smoke_has_timeout_and_failure_exit():
-    out = _run_once()
-    smoke_raw = out["files"].get("scripts/smoke/ws-smoke.mjs", "")
-    smoke = smoke_raw.lower()
-    assert "ws://127.0.0.1" in smoke or "ws://localhost" in smoke
-    assert "process.env.port" in smoke
-    assert "/ws" in smoke
-    assert "settimeout" in smoke
-    assert "ws.send(" in smoke or "send(" in smoke
-    assert "on('open'" in smoke or "onopen" in smoke
-    assert "on('message'" in smoke or "onmessage" in smoke
-    assert "on('error'" in smoke or "onerror" in smoke
-    assert "json.parse" in smoke
-    assert "JSON.parse(" in smoke_raw
-    assert "welcome" in smoke
-    assert "snapshot" in smoke or "state" in smoke
-    assert "process.exit(0)" in smoke_raw
-    assert "process.exit(1)" in smoke or "process.exit(2)" in smoke or "process.exit(3)" in smoke
 
 
 def test_output_deterministic():

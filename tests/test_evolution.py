@@ -15,7 +15,7 @@ import pytest
 from holonpolis.domain import Blueprint, Boundary, EvolutionPolicy
 from holonpolis.domain.skills import ToolSchema
 from holonpolis.kernel.embeddings.default_embedder import set_embedder, SimpleEmbedder
-from holonpolis.kernel.llm.llm_runtime import LLMResponse
+from holonpolis.kernel.llm.llm_runtime import LLMConfig, LLMResponse
 from holonpolis.kernel.lancedb import get_lancedb_factory, reset_factory
 from holonpolis.kernel.storage import HolonPathGuard
 from holonpolis.services.evolution_service import (
@@ -302,6 +302,67 @@ async def test_evolution_service_persists_llm_audit_state(evolution_setup, monke
     assert llm["last_status"] == "succeeded"
     assert llm["last_stage"] == "generate_code"
     assert llm["model"] == "audit-test-model"
+
+
+@pytest.mark.asyncio
+async def test_chat_with_audit_retries_transient_provider_failure(evolution_setup, monkeypatch):
+    """Transient 5xx provider failures should rotate and retry instead of aborting immediately."""
+    holon_id = "audit_retry_holon"
+    await HolonService().create_holon(
+        Blueprint(
+            blueprint_id=f"bp_{holon_id}",
+            holon_id=holon_id,
+            species_id="generalist",
+            name="Audit Retry Holon",
+            purpose="Retry provider failures",
+            boundary=Boundary(),
+            evolution_policy=EvolutionPolicy(),
+        )
+    )
+
+    service = EvolutionService()
+    call_state = {"count": 0}
+    emitted_configs: list[str] = []
+
+    async def fake_chat(*, system_prompt, user_prompt, config=None):
+        call_state["count"] += 1
+        emitted_configs.append(str(getattr(config, "provider_id", "")))
+        if call_state["count"] == 1:
+            raise RuntimeError("Server error '504 Gateway Time-out' for url 'https://example.test/messages'")
+        return LLMResponse(content="ok", model="fallback-model", latency_ms=9)
+
+    def fake_resolve_stage_llm_config(*, holon_id, stage, base_temperature, base_max_tokens):
+        return LLMConfig(
+            provider_id=f"fallback-provider-{call_state['count']}",
+            temperature=base_temperature,
+            max_tokens=base_max_tokens,
+        )
+
+    monkeypatch.setattr(service._llm, "chat", fake_chat)
+    monkeypatch.setattr(service, "_resolve_stage_llm_config", fake_resolve_stage_llm_config)
+
+    response = await service._chat_with_audit(
+        holon_id=holon_id,
+        pending_token="audit-retry-001",
+        stage="generate_code",
+        system_prompt="system",
+        user_prompt="user",
+        config=LLMConfig(provider_id="primary-provider", temperature=0.2, max_tokens=256),
+    )
+
+    state = HolonService().get_holon_state(holon_id)
+    audit = state.get("evolution_audit")
+    llm = audit.get("llm") if isinstance(audit, dict) else {}
+
+    assert response.content == "ok"
+    assert call_state["count"] == 2
+    assert emitted_configs == ["primary-provider", "fallback-provider-1"]
+    assert isinstance(llm, dict)
+    assert llm["call_count"] == 2
+    assert llm["success_count"] == 1
+    assert llm["failure_count"] == 1
+    assert llm["last_status"] == "succeeded"
+    assert llm["model"] == "fallback-model"
 
 
 def test_evolution_stage_routing_prefers_role_configured_providers(monkeypatch):
@@ -908,25 +969,24 @@ class TestProjectContractTests:
         requirements = [
             "execute(...) must return a dict with keys: project_name, project_slug, files, run_instructions.",
             "files must be Dict[str, str] mapping relative file paths to UTF-8 text content.",
-            "Required output file paths: README.md, package.json",
+            "Required output file paths: README.md, package.json, index.html, src/main.jsx, src/app.jsx",
+            "Project goal: Build a cyberpunk bookkeeping frontend dashboard.",
         ]
 
         template = EvolutionService._build_project_contract_tests(requirements)
 
-        assert "test_server_third_party_imports_declared_in_package" in template
-        assert 'assert "ws" in dependencies or "ws" in dev_dependencies' in template
-        assert 'assert "process.env.port" in server' in template
-        assert 'assert "/ws" in server' in template
-        assert 'assert "process.env.port" in smoke' in template
-        assert "assert \".on('/healthz'\" not in server" in template
+        assert "test_package_json_is_valid_and_has_scripts" in template
+        assert "test_frontend_structure_present" in template
+        assert "test_frontend_scripts_support_local_run" in template
         assert "MIN_FILE_COUNT" in template
         assert "test_skill_source_avoids_multiline_fstring_templates" in template
         assert "test_execute_signature_contract" in template
         assert "test_skill_source_avoids_format_template_brace_risk" in template
         assert "test_no_placeholder_tokens" in template
-        assert "test_domain_modules_present_for_large_game" in template
-        assert "test_gameplay_semantics_present" in template
-        assert "test_gameplay_modules_have_substantive_logic" in template
+        assert "test_goal_semantics_present" in template
+        assert "test_substantive_source_logic_present" in template
+        assert "Abyss Arena" not in template
+        assert "apps/server/src/server.mjs" not in template
 
     def test_project_contract_template_encodes_goal_keywords_without_preset_business_logic(self):
         requirements = [
@@ -940,6 +1000,8 @@ class TestProjectContractTests:
         assert "goal_keywords =" in lowered
         assert "alchemy" in lowered
         assert "diplomacy" in lowered
+        assert "generated project" in lowered
+        assert "abyss arena" not in lowered
 
     def test_project_contract_template_passes_contract_validation(self):
         requirements = [
@@ -967,6 +1029,7 @@ class TestProjectContractTests:
             "execute(...) must return a dict with keys: project_name, project_slug, files, run_instructions.",
             "files must be Dict[str, str] mapping relative file paths to UTF-8 text content.",
             "Project goal: Build large multiplayer MMO game with websocket runtime.",
+            "Required output file paths: package.json, apps/server/src/server.mjs, scripts/smoke/ws-smoke.mjs",
         ]
         rules = EvolutionService._project_generation_rules(requirements)
         merged = "\n".join(rules).lower()
@@ -974,6 +1037,24 @@ class TestProjectContractTests:
         assert "/healthz" in merged and "/ws" in merged
         assert "new websocketserver" in merged or "new server" in merged
         assert "process.exit(0)" in merged
+        assert "unrelated business domains" in merged
+
+    def test_project_generation_rules_avoid_server_constraints_for_frontend_only_goals(self):
+        requirements = [
+            "execute(...) must return a dict with keys: project_name, project_slug, files, run_instructions.",
+            "files must be Dict[str, str] mapping relative file paths to UTF-8 text content.",
+            "Required output file paths: package.json, index.html, src/main.jsx, src/app.jsx",
+            "Project goal: Build a cyberpunk bookkeeping frontend dashboard.",
+        ]
+        rules = EvolutionService._project_generation_rules(requirements)
+        merged = "\n".join(rules).lower()
+        assert "front-end entry flow" in merged
+        assert "run_instructions" in merged
+        assert "/healthz" not in merged
+        assert "websocket server" not in merged
+
+    def test_retryable_llm_error_detects_blank_timeouts(self):
+        assert EvolutionService._is_retryable_llm_error(TimeoutError()) is True
 
     def test_failure_repair_hints_cover_common_project_failures(self):
         requirements = [

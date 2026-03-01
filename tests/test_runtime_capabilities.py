@@ -261,6 +261,145 @@ def test_execute():
 
 
 @pytest.mark.asyncio
+async def test_wait_for_evolution_rechecks_terminal_state_at_timeout_boundary(runtime_setup, monkeypatch):
+    """wait_for_evolution() should not raise if completion lands exactly at the timeout edge."""
+    holon_id = "runtime_timeout_edge"
+    await HolonService().create_holon(_blueprint(holon_id))
+    runtime = HolonRuntime(holon_id=holon_id, blueprint=_blueprint(holon_id))
+
+    request = EvolutionRequest(
+        request_id="evo_edge_001",
+        holon_id=holon_id,
+        skill_name="EdgeCaseSkill",
+        description="Timeout edge case",
+        requirements=[],
+        test_cases=[],
+        parent_skills=[],
+        status=EvolutionStatus.EVOLVING,
+        created_at="2026-03-01T00:00:00+00:00",
+    )
+    runtime._evolution_requests[request.request_id] = request
+
+    call_state = {"count": 0}
+
+    def fake_get_evolution_status(request_id):
+        call_state["count"] += 1
+        if call_state["count"] >= 2:
+            request.status = EvolutionStatus.COMPLETED
+            request.completed_at = "2026-03-01T00:00:01+00:00"
+        return request
+
+    monotonic_values = iter([100.0, 101.0, 101.0])
+
+    class _FakeTime:
+        @staticmethod
+        def monotonic():
+            return next(monotonic_values)
+
+    monkeypatch.setattr(runtime, "get_evolution_status", fake_get_evolution_status)
+    monkeypatch.setattr("holonpolis.runtime.holon_runtime.time", _FakeTime)
+
+    status = await runtime.wait_for_evolution(
+        request_id=request.request_id,
+        timeout_seconds=1.0,
+        poll_interval_seconds=0.1,
+    )
+
+    assert status.status == EvolutionStatus.COMPLETED
+    assert call_state["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_get_evolution_status_recovers_terminal_result_from_persisted_audit(runtime_setup):
+    """A fresh runtime instance should recover completed request state from state.json audit data."""
+    holon_id = "runtime_audit_recovery"
+    blueprint = _blueprint(holon_id)
+    service = HolonService()
+    await service.create_holon(blueprint)
+    runtime = HolonRuntime(holon_id=holon_id, blueprint=blueprint)
+
+    service.update_evolution_audit(
+        holon_id,
+        patch={
+            "request_id": "evo_recover_001",
+            "lifecycle": "completed",
+            "phase": "complete",
+            "result": "success",
+            "completed_at": "2026-03-01T00:00:02+00:00",
+            "skill_id": "cyber_ledger",
+            "attestation_id": "att_cyber_ledger_001",
+            "code_path": "skills_local/cyber_ledger/skill.py",
+            "test_path": "skills_local/cyber_ledger/tests.py",
+            "manifest_path": "skills_local/cyber_ledger/manifest.json",
+        },
+    )
+    service.mark_active(
+        holon_id,
+        reason="evolution_complete",
+        details={"service": "test_runtime_capabilities", "request_id": "evo_recover_001"},
+    )
+
+    status = runtime.get_evolution_status("evo_recover_001")
+
+    assert status is not None
+    assert status.status == EvolutionStatus.COMPLETED
+    assert status.result is not None
+    assert status.result["skill_id"] == "cyber_ledger"
+    assert status.result["manifest_path"].endswith("manifest.json")
+
+
+@pytest.mark.asyncio
+async def test_wait_for_evolution_uses_grace_window_for_just_finished_request(runtime_setup, monkeypatch):
+    """A request that completes immediately after the hard deadline should still be observed."""
+    holon_id = "runtime_timeout_grace"
+    await HolonService().create_holon(_blueprint(holon_id))
+    runtime = HolonRuntime(holon_id=holon_id, blueprint=_blueprint(holon_id))
+
+    request = EvolutionRequest(
+        request_id="evo_grace_001",
+        holon_id=holon_id,
+        skill_name="GraceSkill",
+        description="Grace window case",
+        requirements=[],
+        test_cases=[],
+        parent_skills=[],
+        status=EvolutionStatus.EVOLVING,
+        created_at="2026-03-01T00:00:00+00:00",
+    )
+    runtime._evolution_requests[request.request_id] = request
+
+    def fake_get_evolution_status(request_id):
+        return request
+
+    monotonic_values = iter([100.0, 101.0, 101.0, 101.05])
+
+    class _FakeTime:
+        @staticmethod
+        def monotonic():
+            return next(monotonic_values)
+
+    class _FakeAsyncio:
+        @staticmethod
+        async def sleep(delay):
+            _ = delay
+            request.status = EvolutionStatus.COMPLETED
+            request.completed_at = "2026-03-01T00:00:02+00:00"
+
+    monkeypatch.setattr(runtime, "get_evolution_status", fake_get_evolution_status)
+    monkeypatch.setattr("holonpolis.runtime.holon_runtime.time", _FakeTime)
+    monkeypatch.setattr("holonpolis.runtime.holon_runtime.asyncio", _FakeAsyncio)
+
+    status = await runtime.wait_for_evolution(
+        request_id=request.request_id,
+        timeout_seconds=1.0,
+        poll_interval_seconds=0.1,
+    )
+
+    assert status.status == EvolutionStatus.COMPLETED
+    assert status.completed_at == "2026-03-01T00:00:02+00:00"
+
+
+@pytest.mark.asyncio
 async def test_runtime_can_index_and_search_ui_component_library(runtime_setup):
     """UI component libraries should be indexable into memory and searchable."""
     holon_id = "runtime_ui_library"
