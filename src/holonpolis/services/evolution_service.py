@@ -1851,6 +1851,7 @@ Mandatory rules:
                 break
         return keywords
 
+    @staticmethod
     def _build_project_contract_tests(requirements: List[str]) -> str:
         required_paths = EvolutionService._extract_required_paths_from_requirements(requirements)
         min_file_count = EvolutionService._infer_project_min_file_count(requirements)

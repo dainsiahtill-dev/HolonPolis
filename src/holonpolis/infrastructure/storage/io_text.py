@@ -99,6 +99,14 @@ def read_file_safe(path: str) -> str:
         return ""
 
 
+def read_text_utf8(path: str, *, errors: str = "strict") -> str:
+    """Read text using explicit UTF-8 semantics."""
+    if not path or not os.path.isfile(path):
+        return ""
+    with open(path, "r", encoding="utf-8", errors=errors) as handle:
+        return handle.read()
+
+
 def read_json_safe(path: str) -> Optional[Dict[str, Any]]:
     """Safely read JSON file."""
     if not path or not os.path.isfile(path):

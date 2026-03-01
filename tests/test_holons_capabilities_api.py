@@ -160,6 +160,9 @@ def test_evolution_request_and_status_endpoints(client, created_holon, monkeypat
     assert req_resp.status_code == 200
     assert req_resp.json()["request_id"] == "evo_req_001"
     assert req_resp.json()["status"] == "pending"
+    assert req_resp.json()["origin"] == "manual"
+    assert req_resp.json()["attempt_index"] == 1
+    assert req_resp.json()["lineage_id"] is None
 
     status_resp = client.get(
         f"/api/v1/holons/{created_holon}/evolution/requests/evo_req_001"
@@ -168,6 +171,9 @@ def test_evolution_request_and_status_endpoints(client, created_holon, monkeypat
     data = status_resp.json()
     assert data["status"] == "completed"
     assert data["result"]["skill_id"] == "planner_skill"
+    assert data["origin"] == "manual"
+    assert data["attempt_index"] == 1
+    assert data["lineage_id"] is None
 
 
 def test_self_improve_endpoint_returns_reflection_snapshot(client, created_holon, monkeypatch):
@@ -215,6 +221,195 @@ def test_self_improve_endpoint_returns_reflection_snapshot(client, created_holon
     assert payload["reflection_id"] == "reflect_001"
     assert payload["auto_evolution"]["triggered"] is True
     assert payload["suggestions"][0]["suggested_skill"] == "input_contract_guard"
+
+
+def test_self_reflection_endpoint_returns_bounded_history(client, created_holon, monkeypatch):
+    manager = get_holon_manager()
+    runtime = manager.get_runtime(created_holon)
+
+    def fake_get_self_reflection(history_limit=10):
+        assert history_limit == 2
+        return {
+            "status": "analyzed",
+            "reflection_id": "reflect_live_001",
+            "history_count": 3,
+            "history": [
+                {"reflection_id": "reflect_live_001"},
+                {"reflection_id": "reflect_prev_001"},
+            ],
+            "auto_evolution": {"triggered": False},
+        }
+
+    monkeypatch.setattr(runtime, "get_self_reflection", fake_get_self_reflection)
+
+    response = client.get(
+        f"/api/v1/holons/{created_holon}/self-reflection",
+        params={"history_limit": 2},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["reflection_id"] == "reflect_live_001"
+    assert payload["history_count"] == 3
+    assert len(payload["history"]) == 2
+
+
+def test_ui_component_library_endpoints(client, created_holon, monkeypatch):
+    manager = get_holon_manager()
+    runtime = manager.get_runtime(created_holon)
+
+    async def fake_index_ui_component_library(
+        source_path,
+        *,
+        library_name,
+        framework="react",
+        store_mode="full",
+        include_extensions=None,
+        max_file_bytes=60000,
+    ):
+        assert source_path == "./examples/ui-library"
+        assert library_name == "acme-ui"
+        assert framework == "react"
+        assert store_mode == "full"
+        return {
+            "status": "indexed",
+            "holon_id": created_holon,
+            "library_name": library_name,
+            "library_key": "acme-ui",
+            "indexed_components": 2,
+            "reused_components": 0,
+            "skipped_files": 1,
+            "components": [
+                {"component_name": "Button", "relative_path": "Button.tsx"},
+                {"component_name": "SearchInput", "relative_path": "SearchInput.tsx"},
+            ],
+        }
+
+    async def fake_search_ui_component_library(query, *, top_k=3):
+        assert query == "loading button"
+        assert top_k == 2
+        return [
+            {
+                "memory_id": "mem_ui_001",
+                "component_name": "Button",
+                "library_name": "acme-ui",
+                "framework": "react",
+                "relative_path": "Button.tsx",
+                "usage_example": "<Button />",
+                "exports": ["Button"],
+                "dependencies": ["react"],
+                "code_content": "export function Button() { return <button />; }",
+                "score": 0.91,
+            }
+        ]
+
+    monkeypatch.setattr(runtime, "index_ui_component_library", fake_index_ui_component_library)
+    monkeypatch.setattr(runtime, "search_ui_component_library", fake_search_ui_component_library)
+
+    index_response = client.post(
+        f"/api/v1/holons/{created_holon}/ui-library/index",
+        json={
+            "source_path": "./examples/ui-library",
+            "library_name": "acme-ui",
+            "framework": "react",
+            "store_mode": "full",
+            "include_extensions": [".tsx", ".css"],
+            "max_file_bytes": 60000,
+        },
+    )
+    assert index_response.status_code == 200
+    index_payload = index_response.json()
+    assert index_payload["status"] == "indexed"
+    assert index_payload["indexed_components"] == 2
+
+    search_response = client.get(
+        f"/api/v1/holons/{created_holon}/ui-library/components",
+        params={"query": "loading button", "top_k": 2},
+    )
+    assert search_response.status_code == 200
+    search_payload = search_response.json()
+    assert search_payload[0]["component_name"] == "Button"
+    assert search_payload[0]["library_name"] == "acme-ui"
+
+
+def test_reusable_code_library_endpoints(client, created_holon, monkeypatch):
+    manager = get_holon_manager()
+    runtime = manager.get_runtime(created_holon)
+
+    async def fake_index_reusable_code_library(
+        source_path,
+        *,
+        library_name,
+        library_kind="code_asset",
+        framework="generic",
+        store_mode="full",
+        include_extensions=None,
+        max_file_bytes=60000,
+    ):
+        assert source_path == "./examples/shared-sdk"
+        assert library_name == "internal-sdk"
+        assert library_kind == "code_asset"
+        assert framework == "python"
+        return {
+            "status": "indexed",
+            "holon_id": created_holon,
+            "library_name": library_name,
+            "library_key": "internal-sdk",
+            "library_kind": library_kind,
+            "indexed_assets": 1,
+            "reused_assets": 0,
+            "assets": [
+                {"asset_name": "ApiClient", "relative_path": "client.py"},
+            ],
+        }
+
+    async def fake_search_reusable_code_library(query, *, top_k=3, library_kind=None):
+        assert query == "api client sdk"
+        assert top_k == 2
+        assert library_kind == "code_asset"
+        return [
+            {
+                "memory_id": "mem_code_001",
+                "asset_name": "ApiClient",
+                "library_name": "internal-sdk",
+                "library_kind": "code_asset",
+                "relative_path": "client.py",
+                "usage_example": "from module import ApiClient",
+                "exports": ["ApiClient"],
+                "dependencies": [],
+                "code_content": "class ApiClient: pass",
+                "score": 0.93,
+            }
+        ]
+
+    monkeypatch.setattr(runtime, "index_reusable_code_library", fake_index_reusable_code_library)
+    monkeypatch.setattr(runtime, "search_reusable_code_library", fake_search_reusable_code_library)
+
+    index_response = client.post(
+        f"/api/v1/holons/{created_holon}/code-library/index",
+        json={
+            "source_path": "./examples/shared-sdk",
+            "library_name": "internal-sdk",
+            "library_kind": "code_asset",
+            "framework": "python",
+            "store_mode": "full",
+            "include_extensions": [".py"],
+            "max_file_bytes": 60000,
+        },
+    )
+    assert index_response.status_code == 200
+    index_payload = index_response.json()
+    assert index_payload["status"] == "indexed"
+    assert index_payload["indexed_assets"] == 1
+
+    search_response = client.get(
+        f"/api/v1/holons/{created_holon}/code-library/assets",
+        params={"query": "api client sdk", "top_k": 2, "library_kind": "code_asset"},
+    )
+    assert search_response.status_code == 200
+    search_payload = search_response.json()
+    assert search_payload[0]["asset_name"] == "ApiClient"
+    assert search_payload[0]["library_name"] == "internal-sdk"
 
 
 def test_social_and_market_endpoints(client, created_holon, monkeypatch):

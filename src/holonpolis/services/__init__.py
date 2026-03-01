@@ -37,6 +37,14 @@ _EXPORTS = {
         "holonpolis.services.project_incubation_service",
         "ProjectIncubationResult",
     ),
+    "ReusableProjectScaffoldService": (
+        "holonpolis.services.reusable_project_scaffold_service",
+        "ReusableProjectScaffoldService",
+    ),
+    "ReusableProjectScaffold": (
+        "holonpolis.services.reusable_project_scaffold_service",
+        "ReusableProjectScaffold",
+    ),
 }
 
 __all__ = list(_EXPORTS.keys())

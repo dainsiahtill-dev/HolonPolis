@@ -16,16 +16,26 @@ from typing import Any, Callable, Dict, List, Optional
 
 from holonpolis.config import settings
 from holonpolis.domain import Blueprint
+from holonpolis.infrastructure.storage.io_text import write_text_atomic
 from holonpolis.infrastructure.storage.path_guard import ensure_within_root, safe_join
 from holonpolis.infrastructure.time_utils import utc_now_iso
 from holonpolis.kernel.storage import HolonPathGuard
-from holonpolis.runtime.holon_runtime import EvolutionRequest, EvolutionStatus, HolonRuntime
+from holonpolis.runtime.holon_runtime import (
+    CapabilityDeniedError,
+    EvolutionRequest,
+    EvolutionStatus,
+    HolonRuntime,
+)
 from holonpolis.services.genesis_service import GenesisService
 from holonpolis.services.holon_service import HolonService
+from holonpolis.services.reusable_project_scaffold_service import (
+    ReusableProjectScaffold,
+    ReusableProjectScaffoldService,
+)
 
 
 RuntimeFactory = Callable[[str, Optional[Blueprint]], HolonRuntime]
-REQUIRED_CAPABILITIES = ("skill.execute", "evolution.request")
+REQUIRED_CAPABILITIES = ("skill.execute", "evolution.request", "code.library.search")
 
 
 @dataclass(frozen=True)
@@ -38,6 +48,8 @@ class ProjectIncubationSpec:
     skill_name: Optional[str] = None
     execution_payload: Dict[str, Any] = field(default_factory=dict)
     required_files: List[str] = field(default_factory=list)
+    prefer_reusable_scaffold: bool = True
+    allow_evolution_fallback: bool = True
     evolution_timeout_seconds: float = 360.0
     poll_interval_seconds: float = 0.5
 
@@ -57,6 +69,9 @@ class ProjectIncubationResult:
     output_dir: str
     generated_file_count: int
     completed_at: str
+    delivery_mode: str = "evolved_skill"
+    reused_library_key: str = ""
+    run_instructions: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -71,6 +86,9 @@ class ProjectIncubationResult:
             "output_dir": self.output_dir,
             "generated_file_count": self.generated_file_count,
             "completed_at": self.completed_at,
+            "delivery_mode": self.delivery_mode,
+            "reused_library_key": self.reused_library_key,
+            "run_instructions": list(self.run_instructions),
         }
 
 
@@ -82,10 +100,14 @@ class ProjectIncubationService:
         holon_service: Optional[HolonService] = None,
         genesis_service: Optional[GenesisService] = None,
         runtime_factory: Optional[RuntimeFactory] = None,
+        reusable_scaffold_service: Optional[ReusableProjectScaffoldService] = None,
     ):
         self.holon_service = holon_service or HolonService()
         self.genesis_service = genesis_service or GenesisService()
         self.runtime_factory: RuntimeFactory = runtime_factory or self._default_runtime_factory
+        self.reusable_scaffold_service = reusable_scaffold_service or ReusableProjectScaffoldService(
+            holon_service=self.holon_service
+        )
 
     async def incubate_project(self, spec: ProjectIncubationSpec) -> ProjectIncubationResult:
         """Route/spawn via Genesis, evolve capability, execute skill, and materialize files."""
@@ -104,10 +126,38 @@ class ProjectIncubationService:
             self._persist_blueprint(blueprint)
 
         runtime = self.runtime_factory(holon_id, blueprint)
+        reusable_assets = await self._search_reusable_assets(runtime, project_goal)
+        project_slug = self._slugify(project_name)
+
+        if spec.prefer_reusable_scaffold:
+            scaffold = self._try_materialize_reusable_scaffold(
+                holon_id=holon_id,
+                project_name=project_name,
+                project_goal=project_goal,
+                project_slug=project_slug,
+                required_files=required_files,
+                reusable_assets=reusable_assets,
+            )
+            if scaffold is not None:
+                result = self._build_reusable_scaffold_result(
+                    holon_id=holon_id,
+                    route_decision=route_decision,
+                    project_name=project_name,
+                    scaffold=scaffold,
+                )
+                self._write_incubation_report(scaffold.output_dir, result)
+                return result
+            if not spec.allow_evolution_fallback:
+                raise RuntimeError(
+                    "No reusable scaffold matched the project goal and evolution fallback is disabled."
+                )
+
+        requirements = self._build_requirements(project_goal, required_files)
+        requirements.extend(self._build_reusable_asset_requirements(reusable_assets))
         request = await runtime.request_evolution(
             skill_name=skill_name,
             description="Autonomously generate a project scaffold from requirements.",
-            requirements=self._build_requirements(project_goal, required_files),
+            requirements=requirements,
             test_cases=[],
             parent_skills=[],
         )
@@ -152,6 +202,9 @@ class ProjectIncubationService:
             output_dir=str(output_dir),
             generated_file_count=len(files),
             completed_at=utc_now_iso(),
+            delivery_mode="evolved_skill",
+            reused_library_key="",
+            run_instructions=self._extract_run_instructions(execution_result),
         )
         self._write_incubation_report(output_dir, result)
         return result
@@ -224,6 +277,103 @@ class ProjectIncubationService:
             )
         return requirements
 
+    async def _search_reusable_assets(
+        self,
+        runtime: Any,
+        project_goal: str,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve reusable code assets once so all downstream paths use the same context."""
+        search_fn = getattr(runtime, "search_reusable_code_library", None)
+        if not callable(search_fn):
+            return []
+
+        try:
+            assets = await search_fn(query=project_goal, top_k=3)
+        except CapabilityDeniedError:
+            return []
+        except Exception:
+            return []
+
+        if not isinstance(assets, list) or not assets:
+            return []
+        return [item for item in assets if isinstance(item, dict)]
+
+    def _build_reusable_asset_requirements(
+        self,
+        assets: List[Dict[str, Any]],
+    ) -> List[str]:
+        """Inject retrieved reusable code assets into evolution requirements when available."""
+        if not isinstance(assets, list) or not assets:
+            return []
+        lines = [
+            "Reference reusable code assets when they fit the project goal. Reuse compatible patterns and interfaces instead of reinventing them.",
+        ]
+        for item in assets[:3]:
+            asset_name = str(item.get("asset_name") or item.get("component_name") or "unknown_asset").strip()
+            library_name = str(item.get("library_name") or "").strip()
+            relative_path = str(item.get("relative_path") or "").strip()
+            usage_example = str(item.get("usage_example") or "").strip()
+            code_content = str(item.get("code_content") or "").strip()
+
+            summary = f"Reusable asset: {asset_name}"
+            if library_name:
+                summary += f" from {library_name}"
+            if relative_path:
+                summary += f" ({relative_path})"
+            lines.append(summary)
+
+            if usage_example:
+                lines.append(f"Suggested usage: {usage_example}")
+            if code_content:
+                lines.append("Reference snippet:")
+                lines.append(self._truncate_requirement_text(code_content, max_chars=700))
+
+        return lines
+
+    def _try_materialize_reusable_scaffold(
+        self,
+        *,
+        holon_id: str,
+        project_name: str,
+        project_goal: str,
+        project_slug: str,
+        required_files: List[str],
+        reusable_assets: List[Dict[str, Any]],
+    ) -> Optional[ReusableProjectScaffold]:
+        return self.reusable_scaffold_service.try_materialize(
+            holon_id=holon_id,
+            project_name=project_name,
+            project_slug=project_slug,
+            project_goal=project_goal,
+            candidate_assets=reusable_assets,
+            required_files=required_files,
+        )
+
+    def _build_reusable_scaffold_result(
+        self,
+        *,
+        holon_id: str,
+        route_decision: str,
+        project_name: str,
+        scaffold: ReusableProjectScaffold,
+    ) -> ProjectIncubationResult:
+        return ProjectIncubationResult(
+            holon_id=holon_id,
+            route_decision=route_decision,
+            project_name=project_name,
+            project_slug=scaffold.project_slug,
+            request_id=f"reusable_scaffold_{uuid.uuid4().hex[:12]}",
+            evolution_status="reused_scaffold",
+            skill_name="Reusable Scaffold",
+            skill_id=f"reusable_scaffold::{scaffold.library_key}",
+            output_dir=str(scaffold.output_dir),
+            generated_file_count=len(scaffold.copied_files),
+            completed_at=utc_now_iso(),
+            delivery_mode="reusable_scaffold",
+            reused_library_key=scaffold.library_key,
+            run_instructions=list(scaffold.run_instructions),
+        )
+
     def _build_execution_payload(
         self,
         project_name: str,
@@ -263,9 +413,9 @@ class ProjectIncubationService:
     def _persist_blueprint(self, blueprint: Blueprint) -> None:
         holon_dir = safe_join(settings.holons_path, blueprint.holon_id)
         blueprint_path = safe_join(holon_dir, "blueprint.json")
-        blueprint_path.write_text(
-            json.dumps(blueprint.to_dict(), ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        write_text_atomic(
+            str(blueprint_path),
+            json.dumps(blueprint.to_dict(), ensure_ascii=False, indent=2) + "\n",
         )
 
     def _extract_skill_id(self, status: EvolutionRequest, skill_name: str) -> str:
@@ -307,6 +457,17 @@ class ProjectIncubationService:
             return self._slugify(candidate)
         return self._slugify(project_name)
 
+    def _extract_run_instructions(self, execution_result: Dict[str, Any]) -> List[str]:
+        raw = execution_result.get("run_instructions")
+        if not isinstance(raw, list):
+            return []
+        instructions: List[str] = []
+        for item in raw:
+            text = str(item or "").strip()
+            if text:
+                instructions.append(text)
+        return instructions
+
     def _materialize_files(self, holon_id: str, project_slug: str, files: Dict[str, str]) -> Path:
         guard = HolonPathGuard(holon_id)
         run_suffix = f"{int(time.time())}_{uuid.uuid4().hex[:6]}"
@@ -315,15 +476,15 @@ class ProjectIncubationService:
         for rel_path, content in files.items():
             target = output_dir / rel_path
             ensure_within_root(output_dir, target)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
+            write_text_atomic(str(target), content)
         return output_dir
 
     def _write_incubation_report(self, output_dir: Path, result: ProjectIncubationResult) -> None:
         report_path = output_dir / "_incubation_report.json"
-        report_path.write_text(
-            json.dumps(result.to_dict(), ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        ensure_within_root(output_dir, report_path)
+        write_text_atomic(
+            str(report_path),
+            json.dumps(result.to_dict(), ensure_ascii=False, indent=2) + "\n",
         )
 
     def _normalize_generated_rel_path(self, rel_path: Any) -> str:
@@ -385,3 +546,10 @@ class ProjectIncubationService:
             "大型",
         )
         return any(keyword in lowered for keyword in keywords)
+
+    @staticmethod
+    def _truncate_requirement_text(content: str, max_chars: int = 700) -> str:
+        text = str(content or "").strip()
+        if len(text) <= max_chars:
+            return text
+        return text[: max_chars - 3].rstrip() + "..."

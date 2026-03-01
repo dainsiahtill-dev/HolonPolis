@@ -236,6 +236,48 @@ class HolonService:
         existing["self_reflection"] = reflection
         return self._write_state(holon_id, existing)
 
+    def record_ui_component_library_index(
+        self,
+        holon_id: str,
+        library_key: str,
+        snapshot: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Persist UI component library index metadata for dedupe and retrieval."""
+        normalized_key = str(library_key or "").strip() or "default"
+        existing = self._read_state(holon_id)
+        libraries = existing.get("ui_component_libraries")
+        if not isinstance(libraries, dict):
+            libraries = {}
+
+        library_state = dict(snapshot or {})
+        library_state["library_key"] = normalized_key
+        library_state["updated_at"] = utc_now_iso()
+        libraries[normalized_key] = library_state
+
+        existing["ui_component_libraries"] = libraries
+        return self._write_state(holon_id, existing)
+
+    def record_reusable_code_library_index(
+        self,
+        holon_id: str,
+        library_key: str,
+        snapshot: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Persist reusable code asset library metadata for retrieval and dedupe."""
+        normalized_key = str(library_key or "").strip() or "default"
+        existing = self._read_state(holon_id)
+        libraries = existing.get("reusable_code_libraries")
+        if not isinstance(libraries, dict):
+            libraries = {}
+
+        library_state = dict(snapshot or {})
+        library_state["library_key"] = normalized_key
+        library_state["updated_at"] = utc_now_iso()
+        libraries[normalized_key] = library_state
+
+        existing["reusable_code_libraries"] = libraries
+        return self._write_state(holon_id, existing)
+
     def is_pending(self, holon_id: str) -> bool:
         """Check if a Holon is pending."""
         return self.get_holon_status(holon_id) == _STATUS_PENDING

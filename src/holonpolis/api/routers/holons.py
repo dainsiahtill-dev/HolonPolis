@@ -203,6 +203,56 @@ class SelfImproveRequest(BaseModel):
     }
 
 
+class IndexUIComponentLibraryRequest(BaseModel):
+    """Request body for indexing a local UI component library."""
+
+    source_path: str
+    library_name: str
+    framework: str = "react"
+    store_mode: str = Field(default="full", pattern="^(full|snippet)$")
+    include_extensions: List[str] = Field(default_factory=list)
+    max_file_bytes: int = Field(default=60000, ge=512, le=500000)
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "source_path": "./examples/ui-library",
+                "library_name": "acme-ui",
+                "framework": "react",
+                "store_mode": "full",
+                "include_extensions": [".tsx", ".css"],
+                "max_file_bytes": 60000,
+            }
+        }
+    }
+
+
+class IndexReusableCodeLibraryRequest(BaseModel):
+    """Request body for indexing a reusable code library."""
+
+    source_path: str
+    library_name: str
+    library_kind: str = Field(default="code_asset", min_length=1, max_length=64)
+    framework: str = "generic"
+    store_mode: str = Field(default="full", pattern="^(full|snippet)$")
+    include_extensions: List[str] = Field(default_factory=list)
+    max_file_bytes: int = Field(default=60000, ge=512, le=500000)
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "source_path": "./examples/shared-sdk",
+                "library_name": "internal-sdk",
+                "library_kind": "code_asset",
+                "framework": "typescript",
+                "store_mode": "full",
+                "include_extensions": [".ts", ".js"],
+                "max_file_bytes": 60000,
+            }
+        }
+    }
+
+
 class OfferSkillRequest(BaseModel):
     """Request body for publishing a skill offer to marketplace."""
 
@@ -453,6 +503,9 @@ async def request_evolution(
         "skill_name": evo.skill_name,
         "status": evo.status.value,
         "created_at": evo.created_at,
+        "origin": evo.origin,
+        "attempt_index": evo.attempt_index,
+        "lineage_id": evo.lineage_id,
     }
 
 
@@ -478,6 +531,9 @@ async def get_evolution_status(
         "requirements": status.requirements,
         "status": status.status.value,
         "created_at": status.created_at,
+        "origin": status.origin,
+        "attempt_index": status.attempt_index,
+        "lineage_id": status.lineage_id,
         "completed_at": status.completed_at,
         "result": _to_json_safe(status.result),
         "error_message": status.error_message,
@@ -514,6 +570,165 @@ async def self_improve_holon(
         raise HTTPException(status_code=409, detail=str(exc))
     except CapabilityDeniedError as exc:
         raise HTTPException(status_code=403, detail=str(exc))
+    return _to_json_safe(result)
+
+
+@router.get(
+    "/{holon_id}/self-reflection",
+    responses={
+        403: ERROR_403_FORBIDDEN,
+        404: ERROR_404_HOLON,
+    },
+)
+async def get_self_reflection(
+    holon_id: str,
+    history_limit: int = Query(default=5, ge=0, le=50),
+    manager: HolonManager = Depends(get_holon_manager_dep),
+) -> Dict[str, Any]:
+    """Read the latest persisted self-reflection snapshot and bounded history."""
+    runtime = _get_runtime(holon_id, manager)
+    _enforce_capability(
+        runtime,
+        "evolution.self_reflection.read",
+        aliases=["self_reflection", "reflect", "read"],
+    )
+    return _to_json_safe(runtime.get_self_reflection(history_limit=history_limit))
+
+
+@router.post(
+    "/{holon_id}/ui-library/index",
+    responses={
+        403: ERROR_403_FORBIDDEN,
+        404: ERROR_404_HOLON,
+        422: ERROR_422_PAYLOAD,
+    },
+)
+async def index_ui_component_library(
+    holon_id: str,
+    request: IndexUIComponentLibraryRequest,
+    manager: HolonManager = Depends(get_holon_manager_dep),
+) -> Dict[str, Any]:
+    """Index a local UI component library into Holon memory."""
+    runtime = _get_runtime(holon_id, manager)
+    _enforce_capability(
+        runtime,
+        "ui.library.index",
+        aliases=["ui_library", "index"],
+    )
+    try:
+        result = await runtime.index_ui_component_library(
+            source_path=request.source_path,
+            library_name=request.library_name,
+            framework=request.framework,
+            store_mode=request.store_mode,
+            include_extensions=request.include_extensions,
+            max_file_bytes=request.max_file_bytes,
+        )
+    except HolonUnavailableError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return _to_json_safe(result)
+
+
+@router.get(
+    "/{holon_id}/ui-library/components",
+    responses={
+        403: ERROR_403_FORBIDDEN,
+        404: ERROR_404_HOLON,
+        422: ERROR_422_PAYLOAD,
+    },
+)
+async def search_ui_component_library(
+    holon_id: str,
+    query_text: str = Query(..., alias="query", min_length=1, max_length=500),
+    top_k: int = Query(default=3, ge=1, le=10),
+    manager: HolonManager = Depends(get_holon_manager_dep),
+) -> List[Dict[str, Any]]:
+    """Search reusable UI components from the indexed library."""
+    runtime = _get_runtime(holon_id, manager)
+    _enforce_capability(
+        runtime,
+        "ui.library.search",
+        aliases=["ui_library", "search", "retrieve"],
+    )
+    try:
+        result = await runtime.search_ui_component_library(
+            query=query_text,
+            top_k=top_k,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return _to_json_safe(result)
+
+
+@router.post(
+    "/{holon_id}/code-library/index",
+    responses={
+        403: ERROR_403_FORBIDDEN,
+        404: ERROR_404_HOLON,
+        422: ERROR_422_PAYLOAD,
+    },
+)
+async def index_reusable_code_library(
+    holon_id: str,
+    request: IndexReusableCodeLibraryRequest,
+    manager: HolonManager = Depends(get_holon_manager_dep),
+) -> Dict[str, Any]:
+    """Index a reusable code library into Holon memory."""
+    runtime = _get_runtime(holon_id, manager)
+    _enforce_capability(
+        runtime,
+        "code.library.index",
+        aliases=["code_library", "index"],
+    )
+    try:
+        result = await runtime.index_reusable_code_library(
+            source_path=request.source_path,
+            library_name=request.library_name,
+            library_kind=request.library_kind,
+            framework=request.framework,
+            store_mode=request.store_mode,
+            include_extensions=request.include_extensions,
+            max_file_bytes=request.max_file_bytes,
+        )
+    except HolonUnavailableError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return _to_json_safe(result)
+
+
+@router.get(
+    "/{holon_id}/code-library/assets",
+    responses={
+        403: ERROR_403_FORBIDDEN,
+        404: ERROR_404_HOLON,
+        422: ERROR_422_PAYLOAD,
+    },
+)
+async def search_reusable_code_library(
+    holon_id: str,
+    query_text: str = Query(..., alias="query", min_length=1, max_length=500),
+    top_k: int = Query(default=3, ge=1, le=10),
+    library_kind: Optional[str] = Query(default=None, min_length=1, max_length=64),
+    manager: HolonManager = Depends(get_holon_manager_dep),
+) -> List[Dict[str, Any]]:
+    """Search reusable code assets from the indexed library."""
+    runtime = _get_runtime(holon_id, manager)
+    _enforce_capability(
+        runtime,
+        "code.library.search",
+        aliases=["code_library", "search", "retrieve"],
+    )
+    try:
+        result = await runtime.search_reusable_code_library(
+            query=query_text,
+            top_k=top_k,
+            library_kind=library_kind,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     return _to_json_safe(result)
 
 

@@ -72,6 +72,9 @@ class EvolutionRequest:
     parent_skills: List[str]  # Skills to build upon
     status: EvolutionStatus
     created_at: str
+    origin: str = "manual"
+    attempt_index: int = 1
+    lineage_id: Optional[str] = None
     completed_at: Optional[str] = None
     result: Optional[Dict[str, Any]] = None
     error_message: Optional[str] = None
@@ -133,6 +136,9 @@ class HolonRuntime:
         self._holon_service = HolonService()
         self.blueprint = blueprint or self._load_blueprint()
         self.memory = MemoryService(holon_id)
+        self.memory.factory.init_holon_tables(holon_id)
+        self._reusable_code_library = None
+        self._ui_component_library = None
         self.llm = get_llm_runtime()
         self.state = HolonState()
         self._evolution_requests: Dict[str, EvolutionRequest] = {}
@@ -185,6 +191,112 @@ class HolonRuntime:
         ]
         return "\n".join(lines)
 
+    @staticmethod
+    def _summarize_reflection_memory_hit(content: Any, limit: int = 220) -> str:
+        """Convert stored reflection memory into a concise prompt-ready line."""
+        text = str(content or "").strip()
+        prefix = "SELF_REFLECTION "
+        if text.startswith(prefix):
+            raw_payload = text[len(prefix):].strip()
+            try:
+                payload = json.loads(raw_payload)
+            except Exception:
+                payload = {}
+            if isinstance(payload, dict):
+                summary = str(payload.get("summary") or "").strip()
+                gaps = payload.get("gaps")
+                gap_items = [
+                    str(item).strip()
+                    for item in (gaps if isinstance(gaps, list) else [])
+                    if str(item).strip()
+                ]
+                suggestions = payload.get("suggestions")
+                suggestion_items = [
+                    str(item).strip()
+                    for item in (suggestions if isinstance(suggestions, list) else [])
+                    if str(item).strip()
+                ]
+                details: List[str] = []
+                if summary:
+                    details.append(summary)
+                if gap_items:
+                    details.append(f"gaps={', '.join(gap_items[:3])}")
+                if suggestion_items:
+                    details.append(f"suggestions={', '.join(suggestion_items[:2])}")
+                if details:
+                    return " | ".join(details)
+        normalized = re.sub(r"\s+", " ", text)
+        if len(normalized) <= limit:
+            return normalized
+        return normalized[:limit].rstrip() + "..."
+
+    async def _build_reflection_context(
+        self,
+        user_message: str,
+    ) -> str:
+        """Build a high-priority self-reflection context block for chat prompts."""
+        lines: List[str] = []
+        snapshot = self.get_self_reflection(history_limit=2)
+        if str(snapshot.get("status") or "").strip().lower() != "no_reflection":
+            summary = str(snapshot.get("summary") or "").strip()
+            if summary:
+                lines.append(f"- Latest reflection: {summary}")
+
+            capability_gaps = snapshot.get("capability_gaps")
+            if isinstance(capability_gaps, list):
+                gap_ids = [
+                    str(item.get("gap_id") or "").strip()
+                    for item in capability_gaps
+                    if isinstance(item, dict) and str(item.get("gap_id") or "").strip()
+                ]
+                if gap_ids:
+                    lines.append(f"- Active gaps: {', '.join(gap_ids[:3])}")
+
+            auto_evolution = snapshot.get("auto_evolution")
+            if isinstance(auto_evolution, dict) and bool(auto_evolution.get("triggered")):
+                requests = auto_evolution.get("requests")
+                if isinstance(requests, list) and requests:
+                    first = requests[0] if isinstance(requests[0], dict) else {}
+                    if isinstance(first, dict):
+                        skill_name = str(first.get("skill_name") or "").strip()
+                        request_id = str(first.get("request_id") or "").strip()
+                        if skill_name or request_id:
+                            lines.append(
+                                "- In-flight self-evolution: "
+                                f"{skill_name or 'unknown_skill'} ({request_id or 'unknown_request'})"
+                            )
+
+        try:
+            reflection_hits = await self.memory.hybrid_search(
+                query=user_message,
+                top_k=2,
+                vector_weight=0.5,
+                text_weight=0.5,
+                filters={"tags": ["self_reflection"]},
+                min_score=0.0,
+            )
+        except Exception as exc:
+            logger.warning(
+                "self_reflection_context_search_failed",
+                holon_id=self.holon_id,
+                error=str(exc),
+            )
+            reflection_hits = []
+
+        if reflection_hits:
+            seen_hit_lines: set[str] = set()
+            for item in reflection_hits:
+                rendered = self._summarize_reflection_memory_hit(item.content)
+                normalized = rendered.strip()
+                if not normalized or normalized in seen_hit_lines:
+                    continue
+                seen_hit_lines.add(normalized)
+                lines.append(f"- Retrieved lesson: {normalized}")
+
+        if not lines:
+            return ""
+        return "\n\n# Self Reflection Guidance\n" + "\n".join(lines)
+
     async def chat(
         self,
         user_message: str,
@@ -209,17 +321,37 @@ class HolonRuntime:
             query=user_message,
             top_k=5,
         )
+        non_ui_memories = [
+            memory
+            for memory in memories
+            if "ui-component-library" not in set(memory.get("tags", []))
+            and "reusable-code-library" not in set(memory.get("tags", []))
+        ]
 
         # 2. Build LLM messages
         system_prompt = self._build_system_prompt()
+        reflection_context = await self._build_reflection_context(user_message)
+        reusable_code_context = await self._build_reusable_code_context(user_message)
+        ui_component_context = await self._build_ui_component_context(user_message)
 
         # Add memory context if available
-        memory_context = ""
-        if memories:
-            memory_context = "\n\n# Relevant Memories\n" + "\n".join(
-                f"- [{m['kind']}] {m['content'][:200]}"
-                for m in memories
+        memory_sections: List[str] = []
+        if reflection_context:
+            memory_sections.append(reflection_context)
+        if reusable_code_context:
+            memory_sections.append(reusable_code_context)
+        if ui_component_context:
+            memory_sections.append(ui_component_context)
+
+        if non_ui_memories:
+            memory_sections.append(
+                "\n\n# Relevant Memories\n" + "\n".join(
+                    f"- [{m['kind']}] {m['content'][:200]}"
+                    for m in non_ui_memories
+                )
             )
+
+        memory_context = "".join(memory_sections)
 
         messages = [
             LLMMessage(role="system", content=system_prompt + memory_context),
@@ -301,7 +433,7 @@ class HolonRuntime:
                 "holon_id": self.holon_id,
                 "episode_id": episode_id,
                 "latency_ms": latency_ms,
-                "memories_recalled": len(memories),
+                "memories_recalled": len(non_ui_memories),
             }
 
         except Exception as e:
@@ -362,6 +494,241 @@ class HolonRuntime:
         """Recall memories relevant to a query."""
         return await self.memory.recall(query, top_k=top_k)
 
+    def _get_ui_component_library_service(self):
+        """Lazy-load the UI component library service."""
+        if self._ui_component_library is None:
+            from holonpolis.services.ui_component_library_service import UIComponentLibraryService
+
+            self._ui_component_library = UIComponentLibraryService(
+                self.holon_id,
+                memory_service=self.memory,
+            )
+        return self._ui_component_library
+
+    def _get_reusable_code_library_service(self):
+        """Lazy-load the reusable code asset library service."""
+        if self._reusable_code_library is None:
+            from holonpolis.services.reusable_code_library_service import ReusableCodeLibraryService
+
+            self._reusable_code_library = ReusableCodeLibraryService(
+                self.holon_id,
+                memory_service=self.memory,
+            )
+        return self._reusable_code_library
+
+    async def index_reusable_code_library(
+        self,
+        source_path: str,
+        *,
+        library_name: str,
+        library_kind: str = "code_asset",
+        framework: str = "generic",
+        store_mode: str = "full",
+        include_extensions: Optional[List[str]] = None,
+        max_file_bytes: int = 60000,
+    ) -> Dict[str, Any]:
+        """Index a reusable code library into per-Holon memory."""
+        self._assert_runtime_available(action="index_code_library")
+        self.enforce_capability(
+            "code.library.index",
+            aliases=["code_library", "index"],
+        )
+        service = self._get_reusable_code_library_service()
+        return await service.index_local_library(
+            source_path=source_path,
+            library_name=library_name,
+            library_kind=library_kind,
+            framework=framework,
+            store_mode=store_mode,
+            include_extensions=include_extensions,
+            max_file_bytes=max_file_bytes,
+        )
+
+    async def search_reusable_code_library(
+        self,
+        query: str,
+        *,
+        top_k: int = 3,
+        library_kind: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Search reusable code assets stored in memory."""
+        self.enforce_capability(
+            "code.library.search",
+            aliases=["code_library", "search", "retrieve"],
+        )
+        service = self._get_reusable_code_library_service()
+        return await service.search_assets(
+            query=query,
+            top_k=top_k,
+            library_kind=library_kind,
+        )
+
+    async def index_ui_component_library(
+        self,
+        source_path: str,
+        *,
+        library_name: str,
+        framework: str = "react",
+        store_mode: str = "full",
+        include_extensions: Optional[List[str]] = None,
+        max_file_bytes: int = 60000,
+    ) -> Dict[str, Any]:
+        """Index a local UI component library into per-Holon memory."""
+        self._assert_runtime_available(action="index_ui_library")
+        self.enforce_capability(
+            "ui.library.index",
+            aliases=["ui_library", "index"],
+        )
+        service = self._get_ui_component_library_service()
+        return await service.index_local_library(
+            source_path=source_path,
+            library_name=library_name,
+            framework=framework,
+            store_mode=store_mode,
+            include_extensions=include_extensions,
+            max_file_bytes=max_file_bytes,
+        )
+
+    async def search_ui_component_library(
+        self,
+        query: str,
+        *,
+        top_k: int = 3,
+    ) -> List[Dict[str, Any]]:
+        """Search the indexed UI component memory for reusable code."""
+        self.enforce_capability(
+            "ui.library.search",
+            aliases=["ui_library", "search", "retrieve"],
+        )
+        service = self._get_ui_component_library_service()
+        return await service.search_components(query=query, top_k=top_k)
+
+    @staticmethod
+    def _looks_like_code_generation_request(user_message: str) -> bool:
+        """Heuristically detect project/code generation requests."""
+        normalized = str(user_message or "").strip().lower()
+        if not normalized:
+            return False
+
+        keywords = (
+            "build",
+            "create",
+            "generate",
+            "implement",
+            "scaffold",
+            "starter",
+            "template",
+            "sdk",
+            "client",
+            "api",
+            "backend",
+            "frontend",
+            "library",
+            "package",
+            "project",
+            "代码",
+            "项目",
+            "生成",
+            "构建",
+            "搭建",
+            "实现",
+            "脚手架",
+            "组件库",
+            "代码库",
+        )
+        return any(keyword in normalized for keyword in keywords)
+
+    @staticmethod
+    def _looks_like_frontend_request(user_message: str) -> bool:
+        """Heuristically detect frontend/UI-oriented requests."""
+        normalized = str(user_message or "").strip().lower()
+        if not normalized:
+            return False
+
+        keywords = (
+            "ui",
+            "ux",
+            "frontend",
+            "front-end",
+            "component",
+            "react",
+            "vue",
+            "svelte",
+            "tailwind",
+            "page",
+            "layout",
+            "button",
+            "form",
+            "dashboard",
+            "design system",
+            "css",
+            "style",
+            "theme",
+            "front end",
+            "前端",
+            "组件",
+            "页面",
+            "界面",
+            "按钮",
+            "表单",
+            "布局",
+            "样式",
+            "导航",
+        )
+        return any(keyword in normalized for keyword in keywords)
+
+    async def _build_ui_component_context(self, user_message: str) -> str:
+        """Build a prompt context block with retrieved UI component code."""
+        if not self._looks_like_frontend_request(user_message):
+            return ""
+        if not self.is_capability_allowed(
+            "ui.library.search",
+            aliases=["ui_library", "search", "retrieve"],
+        ):
+            return ""
+
+        service = self._get_ui_component_library_service()
+        try:
+            return await service.build_prompt_context(
+                user_message,
+                top_k=2,
+                max_code_chars=2600,
+            )
+        except Exception as exc:
+            logger.warning(
+                "ui_component_context_build_failed",
+                holon_id=self.holon_id,
+                error=str(exc),
+            )
+            return ""
+
+    async def _build_reusable_code_context(self, user_message: str) -> str:
+        """Build a prompt context block with retrieved reusable code assets."""
+        if not self._looks_like_code_generation_request(user_message):
+            return ""
+        if not self.is_capability_allowed(
+            "code.library.search",
+            aliases=["code_library", "search", "retrieve"],
+        ):
+            return ""
+
+        service = self._get_reusable_code_library_service()
+        try:
+            return await service.build_prompt_context(
+                user_message,
+                top_k=2,
+                max_code_chars=2600,
+                library_kind="code_asset",
+                heading="Retrieved Reusable Code Assets",
+            )
+        except Exception as exc:
+            logger.warning(
+                "reusable_code_context_build_failed",
+                holon_id=self.holon_id,
+                error=str(exc),
+            )
+            return ""
+
     async def request_evolution(
         self,
         skill_name: str,
@@ -369,6 +736,10 @@ class HolonRuntime:
         requirements: List[str],
         test_cases: Optional[List[Dict[str, Any]]] = None,
         parent_skills: Optional[List[str]] = None,
+        *,
+        origin: str = "manual",
+        attempt_index: int = 1,
+        lineage_id: Optional[str] = None,
     ) -> EvolutionRequest:
         """Request evolution of a new skill through RGV (Red-Green-Verify).
 
@@ -410,6 +781,9 @@ class HolonRuntime:
             parent_skills=parent_skills or [],
             status=EvolutionStatus.PENDING,
             created_at=utc_now_iso(),
+            origin=str(origin or "manual").strip() or "manual",
+            attempt_index=max(1, int(attempt_index)),
+            lineage_id=str(lineage_id or "").strip() or None,
         )
 
         # Store request
@@ -591,6 +965,102 @@ class HolonRuntime:
                 error=str(exc),
             )
 
+    @staticmethod
+    def _build_reflection_memory_content(reflection: Dict[str, Any]) -> str:
+        """Render a compact structured summary suitable for retrieval."""
+        payload = reflection if isinstance(reflection, dict) else {}
+        trigger = payload.get("trigger")
+        trigger_map = trigger if isinstance(trigger, dict) else {}
+        capability_gaps = payload.get("capability_gaps")
+        gap_list = capability_gaps if isinstance(capability_gaps, list) else []
+        suggestions = payload.get("suggestions")
+        suggestion_list = suggestions if isinstance(suggestions, list) else []
+        auto_evolution = payload.get("auto_evolution")
+        auto_map = auto_evolution if isinstance(auto_evolution, dict) else {}
+
+        gap_ids = [
+            str(item.get("gap_id") or "").strip()
+            for item in gap_list
+            if isinstance(item, dict) and str(item.get("gap_id") or "").strip()
+        ]
+        suggestion_tokens: List[str] = []
+        for item in suggestion_list:
+            if not isinstance(item, dict):
+                continue
+            token = str(
+                item.get("suggested_skill")
+                or item.get("skill_name")
+                or item.get("type")
+                or ""
+            ).strip()
+            if token:
+                suggestion_tokens.append(token)
+            if len(suggestion_tokens) >= 3:
+                break
+
+        envelope = {
+            "reflection_id": str(payload.get("reflection_id") or "").strip(),
+            "status": str(payload.get("status") or "").strip(),
+            "summary": str(payload.get("summary") or "").strip(),
+            "trigger_type": str(trigger_map.get("type") or "").strip(),
+            "trigger_request_id": str(trigger_map.get("request_id") or "").strip(),
+            "gaps": gap_ids[:4],
+            "suggestions": suggestion_tokens,
+            "auto_evolution": {
+                "triggered": bool(auto_map.get("triggered")),
+                "request_count": int(auto_map.get("request_count", 0) or 0),
+            },
+        }
+        return "SELF_REFLECTION " + json.dumps(envelope, sort_keys=True)
+
+    async def _safe_persist_reflection_memory(
+        self,
+        reflection: Dict[str, Any],
+        *,
+        phase_tag: str,
+    ) -> None:
+        """Persist structured self-reflection as retrievable memory."""
+        payload = reflection if isinstance(reflection, dict) else {}
+        phase = str(phase_tag or "analysis").strip().lower() or "analysis"
+        tags = ["self_reflection", phase]
+        status = str(payload.get("status") or "").strip().lower()
+        if status:
+            tags.append(status)
+
+        capability_gaps = payload.get("capability_gaps")
+        if isinstance(capability_gaps, list):
+            for item in capability_gaps:
+                if not isinstance(item, dict):
+                    continue
+                gap_id = str(item.get("gap_id") or "").strip().lower()
+                if gap_id:
+                    tags.append(gap_id)
+                if len(tags) >= 6:
+                    break
+
+        deduped_tags: List[str] = []
+        seen_tags: set[str] = set()
+        for tag in tags:
+            normalized = str(tag or "").strip().lower()
+            if not normalized or normalized in seen_tags:
+                continue
+            seen_tags.add(normalized)
+            deduped_tags.append(normalized)
+
+        try:
+            await self.memory.remember(
+                content=self._build_reflection_memory_content(payload),
+                kind=MemoryKind.PATTERN,
+                tags=deduped_tags,
+                importance=0.95 if phase == "evolution_failure" else 0.85,
+            )
+        except Exception as exc:
+            logger.warning(
+                "self_reflection_memory_write_failed",
+                holon_id=self.holon_id,
+                error=str(exc),
+            )
+
     async def _safe_learn_from_evolution_failure(
         self,
         request: EvolutionRequest,
@@ -608,6 +1078,143 @@ class HolonRuntime:
                 request_id=request.request_id,
                 error=str(exc),
             )
+
+    def _max_reflective_attempts_for_request(self) -> int:
+        """Cap autonomous cross-request retries using the blueprint policy."""
+        configured = max(1, int(self.blueprint.evolution_policy.max_evolution_attempts))
+        strategy = self.blueprint.evolution_policy.strategy
+        if strategy.value == "conservative":
+            return 1
+        if strategy.value == "balanced":
+            return min(configured, 2)
+        return configured
+
+    @staticmethod
+    def _summarize_repair_actions(actions: Any, limit: int = 2) -> List[str]:
+        """Keep follow-up repair actions compact and deterministic."""
+        if not isinstance(actions, list):
+            return []
+        normalized: List[str] = []
+        for item in actions:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            normalized.append(text)
+            if len(normalized) >= max(1, int(limit)):
+                break
+        return normalized
+
+    async def _persist_failure_reflection_snapshot(
+        self,
+        request: EvolutionRequest,
+        improvement_plan: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Persist a targeted post-mortem snapshot so failures become reusable context."""
+        next_round = improvement_plan.get("next_round_plan")
+        next_round_plan = next_round if isinstance(next_round, dict) else {}
+        reflection_id = f"reflect_{uuid.uuid4().hex[:12]}"
+        created_at = utc_now_iso()
+        failure_phase = str(improvement_plan.get("failure_phase") or "unknown").strip()
+        failure_summary = self._normalize_reflection_message(
+            improvement_plan.get("failure_summary") or request.error_message or "evolution_failed"
+        )
+        max_attempts = self._max_reflective_attempts_for_request()
+        remaining_attempts = max(0, max_attempts - int(request.attempt_index))
+        can_continue = bool(
+            improvement_plan.get("retry_recommended")
+            and remaining_attempts > 0
+        )
+
+        capability_gaps = [
+            {
+                "gap_id": str(next_round_plan.get("focus") or "evolution_resilience").strip() or "evolution_resilience",
+                "severity": "high",
+                "reason": failure_summary,
+            }
+        ]
+        summary = (
+            f"Evolution reflection for {request.skill_name}: "
+            f"phase={failure_phase}, attempt={request.attempt_index}/{max_attempts}, "
+            f"continuation={'yes' if can_continue else 'no'}"
+        )
+        snapshot: Dict[str, Any] = {
+            "status": "evolution_failure_reflected",
+            "reflection_id": reflection_id,
+            "created_at": created_at,
+            "summary": summary,
+            "trigger": {
+                "type": "evolution_failure",
+                "request_id": request.request_id,
+                "lineage_id": request.lineage_id or request.request_id,
+            },
+            "metrics": {
+                "failure_phase": failure_phase,
+                "attempt_index": int(request.attempt_index),
+                "max_reflective_attempts": max_attempts,
+                "remaining_reflective_attempts": remaining_attempts,
+                "continuation_allowed": can_continue,
+            },
+            "capability_gaps": capability_gaps,
+            "suggestions": [
+                {
+                    "type": "retry_same_skill",
+                    "reason": failure_summary,
+                    "skill_name": request.skill_name,
+                    "repair_actions": self._summarize_repair_actions(
+                        next_round_plan.get("repair_actions", [])
+                    ),
+                    "revised_requirements": list(next_round_plan.get("revised_requirements", []))
+                    if isinstance(next_round_plan.get("revised_requirements"), list)
+                    else [],
+                }
+            ],
+            "auto_evolution": {
+                "requested": can_continue,
+                "triggered": False,
+                "request_count": 0,
+                "requests": [],
+                "skipped": [],
+            },
+        }
+
+        self._holon_service.record_self_reflection(self.holon_id, snapshot)
+        await self._safe_remember(
+            content=summary,
+            tags=["self_improvement", "reflection", "evolution_failure", request.skill_name],
+            importance=0.95,
+        )
+        return snapshot
+
+    async def _continue_evolution_after_failure(
+        self,
+        request: EvolutionRequest,
+        improvement_plan: Dict[str, Any],
+    ) -> Optional[EvolutionRequest]:
+        """Schedule one follow-up evolution request when policy still allows it."""
+        max_attempts = self._max_reflective_attempts_for_request()
+        if int(request.attempt_index) >= max_attempts:
+            return None
+
+        next_round = improvement_plan.get("next_round_plan")
+        next_round_plan = next_round if isinstance(next_round, dict) else {}
+        revised_requirements = next_round_plan.get("revised_requirements")
+        if not isinstance(revised_requirements, list) or not revised_requirements:
+            return None
+
+        follow_up_description = (
+            f"{request.description} | self-repair attempt {int(request.attempt_index) + 1}"
+        ).strip()
+        follow_up = await self.request_evolution(
+            skill_name=request.skill_name,
+            description=follow_up_description,
+            requirements=[str(item).strip() for item in revised_requirements if str(item).strip()],
+            test_cases=list(request.test_cases),
+            parent_skills=list(request.parent_skills),
+            origin="self_reflection_recovery",
+            attempt_index=int(request.attempt_index) + 1,
+            lineage_id=request.lineage_id or request.request_id,
+        )
+        return follow_up
 
     @staticmethod
     def _summarize_failure_message(message: Any, limit: int = 220) -> str:
@@ -711,6 +1318,8 @@ class HolonRuntime:
         improvement_plan = self._build_failure_improvement_plan(request, result)
         request.result = improvement_plan
 
+        reflection_snapshot = await self._persist_failure_reflection_snapshot(request, improvement_plan)
+
         await self.remember(
             content=(
                 f"Evolution failed for {request.skill_name}: {improvement_plan['failure_summary']} | "
@@ -718,6 +1327,85 @@ class HolonRuntime:
             ),
             tags=["evolution", "failure", "improvement_plan", request.skill_name],
             importance=0.8,
+        )
+
+        follow_up: Optional[EvolutionRequest] = None
+        try:
+            follow_up = await self._continue_evolution_after_failure(request, improvement_plan)
+        except Exception as exc:
+            logger.warning(
+                "evolution_failure_continuation_failed",
+                holon_id=self.holon_id,
+                request_id=request.request_id,
+                error=str(exc),
+            )
+            improvement_plan["follow_up"] = {
+                "triggered": False,
+                "error": str(exc),
+            }
+            reflection_snapshot["auto_evolution"] = {
+                "requested": True,
+                "triggered": False,
+                "request_count": 0,
+                "requests": [],
+                "skipped": [{"reason": "request_failed", "detail": str(exc)}],
+            }
+            self._holon_service.record_self_reflection(self.holon_id, reflection_snapshot)
+            await self._safe_persist_reflection_memory(
+                reflection_snapshot,
+                phase_tag="evolution_failure",
+            )
+            return
+
+        if follow_up is None:
+            improvement_plan["follow_up"] = {
+                "triggered": False,
+                "reason": "budget_exhausted_or_missing_revised_requirements",
+            }
+            reflection_snapshot["auto_evolution"] = {
+                "requested": False,
+                "triggered": False,
+                "request_count": 0,
+                "requests": [],
+                "skipped": [
+                    {
+                        "reason": "budget_exhausted_or_missing_revised_requirements",
+                    }
+                ],
+            }
+            self._holon_service.record_self_reflection(self.holon_id, reflection_snapshot)
+            await self._safe_persist_reflection_memory(
+                reflection_snapshot,
+                phase_tag="evolution_failure",
+            )
+            return
+
+        improvement_plan["follow_up"] = {
+            "triggered": True,
+            "request_id": follow_up.request_id,
+            "attempt_index": follow_up.attempt_index,
+            "lineage_id": follow_up.lineage_id,
+            "origin": follow_up.origin,
+        }
+        reflection_snapshot["auto_evolution"] = {
+            "requested": True,
+            "triggered": True,
+            "request_count": 1,
+            "requests": [
+                {
+                    "request_id": follow_up.request_id,
+                    "skill_name": follow_up.skill_name,
+                    "attempt_index": follow_up.attempt_index,
+                    "lineage_id": follow_up.lineage_id,
+                    "origin": follow_up.origin,
+                }
+            ],
+            "skipped": [],
+        }
+        self._holon_service.record_self_reflection(self.holon_id, reflection_snapshot)
+        await self._safe_persist_reflection_memory(
+            reflection_snapshot,
+            phase_tag="evolution_failure",
         )
 
     @staticmethod
@@ -1315,6 +2003,10 @@ class HolonRuntime:
             tags=["self_improvement", "analysis", "reflection"],
             importance=0.9,
         )
+        await self._safe_persist_reflection_memory(
+            reflection,
+            phase_tag="analysis",
+        )
 
         return reflection
 
@@ -1362,6 +2054,25 @@ class HolonRuntime:
     def get_evolution_status(self, request_id: str) -> Optional[EvolutionRequest]:
         """Get status of an evolution request."""
         return self._evolution_requests.get(request_id)
+
+    def get_self_reflection(self, history_limit: int = 10) -> Dict[str, Any]:
+        """Return the latest persisted self-reflection snapshot with bounded history."""
+        limit = max(0, int(history_limit))
+        state_payload = self._holon_service.get_holon_state(self.holon_id)
+        reflection = state_payload.get("self_reflection")
+        if not isinstance(reflection, dict):
+            return {
+                "status": "no_reflection",
+                "history": [],
+                "history_count": 0,
+            }
+
+        payload = dict(reflection)
+        history = payload.get("history")
+        history_items = [item for item in history if isinstance(item, dict)] if isinstance(history, list) else []
+        payload["history_count"] = len(history_items)
+        payload["history"] = history_items[:limit] if limit > 0 else []
+        return payload
 
     async def wait_for_evolution(
         self,
