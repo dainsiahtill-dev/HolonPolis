@@ -11,6 +11,7 @@ Self-Evolution Capabilities:
 """
 
 import asyncio
+from collections import Counter
 import importlib.util
 import inspect
 import json
@@ -388,6 +389,7 @@ class HolonRuntime:
             EvolutionRequest with status and result
         """
         self._assert_runtime_available(action="evolve")
+        self.enforce_capability("evolution.request", aliases=["evolve", "execute"])
         request_id = f"evo_{uuid.uuid4().hex[:12]}"
 
         logger.info(
@@ -718,69 +720,603 @@ class HolonRuntime:
             importance=0.8,
         )
 
-    async def self_improve(self) -> Dict[str, Any]:
-        """Analyze own performance and suggest improvements.
+    @staticmethod
+    def _normalize_reflection_message(value: Any) -> str:
+        """Normalize noisy error text into a compact reflection signal."""
+        text = re.sub(r"\s+", " ", str(value or "").strip())
+        return text or "unknown"
 
-        This method allows a Holon to:
-        1. Analyze its success/failure patterns
-        2. Identify gaps in its capabilities
-        3. Request evolution of new skills to fill gaps
+    @classmethod
+    def _classify_failure_category(
+        cls,
+        detail: Any,
+        *,
+        phase: str = "",
+    ) -> str:
+        """Bucket failures into reusable adaptation categories."""
+        normalized_phase = str(phase or "").strip().lower()
+        if normalized_phase in {"red", "green", "verify", "persist"}:
+            return f"evolution_{normalized_phase}"
 
-        Returns:
-            Improvement plan with suggested evolutions
-        """
-        # Analyze recent episodes
-        recent_episodes = await self.memory.get_episodes(limit=100)
+        text = cls._normalize_reflection_message(detail).lower()
+        if any(
+            token in text
+            for token in (
+                "schema",
+                "payload",
+                "contract",
+                "validation",
+                "missing required",
+                "unexpected field",
+                "missing required field",
+            )
+        ):
+            return "contract"
+        if any(
+            token in text
+            for token in ("memory", "recall", "retrieval", "context window", "context")
+        ):
+            return "memory"
+        if any(
+            token in text
+            for token in (
+                "security",
+                "unsafe",
+                "forbidden",
+                "denied",
+                "static scan",
+                "ast",
+                "sandbox",
+            )
+        ):
+            return "safety"
+        if any(
+            token in text
+            for token in ("timeout", "timed out", "latency", "slow", "deadline", "too long")
+        ):
+            return "latency"
+        if any(
+            token in text
+            for token in ("tool", "subprocess", "permission", "filesystem", "write access")
+        ):
+            return "tooling"
+        return "execution"
 
-        # Calculate metrics
-        total = len(recent_episodes)
-        if total == 0:
-            return {"status": "no_data", "suggestions": []}
+    def _collect_failure_signals(
+        self,
+        recent_episodes: List[Dict[str, Any]],
+        latest_audit: Dict[str, Any],
+    ) -> List[Dict[str, str]]:
+        """Collect failure signals from episodes plus recent evolution telemetry."""
+        signals: List[Dict[str, str]] = []
 
-        successes = sum(1 for e in recent_episodes if e.get('outcome') == 'success')
-        failures = sum(1 for e in recent_episodes if e.get('outcome') == 'failure')
-        success_rate = successes / total if total > 0 else 0
+        for episode in recent_episodes:
+            if str(episode.get("outcome") or "").strip().lower() != "failure":
+                continue
+            details = episode.get("outcome_details")
+            detail_map = details if isinstance(details, dict) else {}
+            message = (
+                detail_map.get("error")
+                or detail_map.get("message")
+                or detail_map.get("reason")
+                or "episode_failed"
+            )
+            normalized_message = self._normalize_reflection_message(message)
+            signals.append(
+                {
+                    "source": "episode",
+                    "category": self._classify_failure_category(normalized_message),
+                    "message": normalized_message,
+                }
+            )
 
-        # Identify common failure patterns
-        failure_patterns = {}
-        for ep in recent_episodes:
-            if ep.get('outcome') == 'failure':
-                error = ep.get('outcome_details', {}).get('error', 'unknown')
-                failure_patterns[error] = failure_patterns.get(error, 0) + 1
+        for request in self._evolution_requests.values():
+            if request.status != EvolutionStatus.FAILED:
+                continue
+            result_payload = request.result if isinstance(request.result, dict) else {}
+            failure_phase = ""
+            if isinstance(result_payload, dict):
+                failure_phase = str(result_payload.get("failure_phase") or "").strip()
+            message = (
+                request.error_message
+                or (result_payload.get("failure_summary") if isinstance(result_payload, dict) else "")
+                or "evolution_failed"
+            )
+            normalized_message = self._normalize_reflection_message(message)
+            signals.append(
+                {
+                    "source": "evolution_request",
+                    "category": self._classify_failure_category(
+                        normalized_message,
+                        phase=failure_phase,
+                    ),
+                    "message": normalized_message,
+                }
+            )
 
-        # Generate improvement suggestions
-        suggestions = []
+        audit_result = str(latest_audit.get("result") or "").strip().lower()
+        audit_error = str(latest_audit.get("error") or "").strip()
+        if audit_result == "failed" or audit_error:
+            audit_phase = str(latest_audit.get("phase") or "").strip()
+            normalized_message = self._normalize_reflection_message(audit_error or "evolution_audit_failed")
+            signals.append(
+                {
+                    "source": "state_audit",
+                    "category": self._classify_failure_category(
+                        normalized_message,
+                        phase=audit_phase,
+                    ),
+                    "message": normalized_message,
+                }
+            )
 
-        if success_rate < 0.8:
-            suggestions.append({
-                "type": "evolve_skill",
-                "reason": f"Low success rate ({success_rate:.1%})",
-                "suggested_skill": "error_recovery",
-            })
+        return signals
 
-        if failures > 10:
-            suggestions.append({
-                "type": "improve_memory",
-                "reason": "High failure count suggests memory gaps",
-                "action": "consolidate_more_memories",
-            })
+    def _derive_self_improvement_actions(
+        self,
+        *,
+        total_episodes: int,
+        success_rate: float,
+        failures: int,
+        avg_latency_ms: int,
+        skill_count: int,
+        failure_categories: Dict[str, int],
+        max_suggestions: int,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Convert reflection metrics into concrete capability gaps and repair actions."""
+        capability_gaps: List[Dict[str, Any]] = []
+        suggestions: List[Dict[str, Any]] = []
+        seen_gaps: set[str] = set()
+        seen_skills: set[str] = set()
 
-        # Store self-analysis
-        await self.remember(
-            content=f"Self-improvement analysis: {success_rate:.1%} success rate, {len(suggestions)} suggestions",
-            tags=["self_improvement", "analysis"],
-            importance=0.9,
+        def add_gap(gap_id: str, severity: str, reason: str) -> None:
+            if gap_id in seen_gaps:
+                return
+            seen_gaps.add(gap_id)
+            capability_gaps.append(
+                {
+                    "gap_id": gap_id,
+                    "severity": severity,
+                    "reason": reason,
+                }
+            )
+
+        def add_evolution_suggestion(
+            *,
+            priority: str,
+            suggested_skill: str,
+            reason: str,
+            description: str,
+            requirements: List[str],
+        ) -> None:
+            if len(suggestions) >= max_suggestions:
+                return
+            normalized_skill = str(suggested_skill or "").strip().lower()
+            if not normalized_skill or normalized_skill in seen_skills:
+                return
+            seen_skills.add(normalized_skill)
+            suggestions.append(
+                {
+                    "type": "evolve_skill",
+                    "priority": priority,
+                    "reason": reason,
+                    "suggested_skill": suggested_skill,
+                    "description": description,
+                    "requirements": list(requirements),
+                }
+            )
+
+        def add_memory_suggestion(priority: str, reason: str, action: str) -> None:
+            if len(suggestions) >= max_suggestions:
+                return
+            suggestions.append(
+                {
+                    "type": "improve_memory",
+                    "priority": priority,
+                    "reason": reason,
+                    "action": action,
+                }
+            )
+
+        contract_failures = int(failure_categories.get("contract", 0) or 0) + int(
+            failure_categories.get("evolution_red", 0) or 0
         )
+        execution_failures = int(failure_categories.get("execution", 0) or 0) + int(
+            failure_categories.get("evolution_green", 0) or 0
+        )
+        safety_failures = int(failure_categories.get("safety", 0) or 0) + int(
+            failure_categories.get("evolution_verify", 0) or 0
+        )
+        memory_failures = int(failure_categories.get("memory", 0) or 0)
+        latency_failures = int(failure_categories.get("latency", 0) or 0)
+
+        if contract_failures > 0:
+            add_gap(
+                "input_contracts",
+                "high",
+                f"Detected {contract_failures} contract/schema failures in recent behavior.",
+            )
+            add_evolution_suggestion(
+                priority="high",
+                suggested_skill="input_contract_guard",
+                reason="Repeated contract mismatches indicate unstable external interfaces.",
+                description="Validate and normalize inbound payloads before core execution.",
+                requirements=[
+                    "Reject malformed payloads deterministically.",
+                    "Return machine-readable validation errors.",
+                    "Preserve sandbox-safe pure functions only.",
+                ],
+            )
+
+        if execution_failures > 0 or (total_episodes > 0 and success_rate < 0.8):
+            add_gap(
+                "execution_resilience",
+                "high" if execution_failures > 0 else "medium",
+                (
+                    f"Success rate is {success_rate:.1%} with {execution_failures} execution-side failures."
+                    if total_episodes > 0
+                    else "Execution resilience is unproven."
+                ),
+            )
+            add_evolution_suggestion(
+                priority="high" if execution_failures > 0 else "medium",
+                suggested_skill="reliability_guard",
+                reason="Core execution paths need deterministic guardrails and safer fallbacks.",
+                description="Harden runtime execution with normalization, guard clauses, and deterministic fallbacks.",
+                requirements=[
+                    "Handle empty and malformed input without raising exceptions.",
+                    "Keep output deterministic for identical inputs.",
+                    "Prefer small pure helper functions over branching side effects.",
+                ],
+            )
+
+        if safety_failures > 0:
+            add_gap(
+                "sandbox_safety",
+                "high",
+                f"Detected {safety_failures} safety or verification failures in evolution output.",
+            )
+            add_evolution_suggestion(
+                priority="high",
+                suggested_skill="sandbox_compliance_guard",
+                reason="Evolution retries are leaking unsafe constructs into generated code.",
+                description="Pre-screen generated code for unsafe imports and sandbox-breaking patterns.",
+                requirements=[
+                    "Reject banned imports and dynamic execution constructs.",
+                    "Surface concise remediation guidance for verify-phase failures.",
+                    "Keep all checks deterministic and offline.",
+                ],
+            )
+
+        if memory_failures > 0 or failures >= max(3, total_episodes // 3 if total_episodes > 0 else 3):
+            add_gap(
+                "memory_retrieval",
+                "medium",
+                "Recent failures suggest the Holon is not reusing prior lessons effectively.",
+            )
+            add_memory_suggestion(
+                priority="medium",
+                reason="Promote more structured postmortems so failed episodes become retrievable lessons.",
+                action="promote_failure_postmortems",
+            )
+
+        if latency_failures > 0 or avg_latency_ms >= 2500:
+            add_gap(
+                "latency_control",
+                "medium",
+                f"Average latency is {avg_latency_ms}ms with {latency_failures} latency-related failures.",
+            )
+            add_evolution_suggestion(
+                priority="medium",
+                suggested_skill="latency_optimizer",
+                reason="Latency is becoming a usability bottleneck.",
+                description="Trim avoidable runtime overhead and keep responses within predictable latency budgets.",
+                requirements=[
+                    "Prefer early exits for invalid work.",
+                    "Avoid redundant LLM or tool calls for repeated requests.",
+                    "Emit deterministic metrics suitable for regression tests.",
+                ],
+            )
+
+        if skill_count < 2:
+            add_gap(
+                "capability_divergence",
+                "medium",
+                "The Holon has too few differentiated skills to explore adjacent problem spaces.",
+            )
+            add_evolution_suggestion(
+                priority="medium",
+                suggested_skill="capability_explorer",
+                reason="Low skill diversity limits adaptive range and long-term usefulness.",
+                description="Generate narrow adjacent capabilities that expand the Holon's usable frontier.",
+                requirements=[
+                    "Propose one adjacent capability at a time.",
+                    "Keep each new capability testable through a deterministic execute contract.",
+                    "Avoid duplicating already persisted skills.",
+                ],
+            )
+
+        if not suggestions:
+            add_evolution_suggestion(
+                priority="low",
+                suggested_skill="adjacent_capability_probe",
+                reason="Current telemetry is healthy; expand cautiously into neighboring capabilities.",
+                description="Probe one adjacent capability so the Holon keeps diverging instead of stagnating.",
+                requirements=[
+                    "Keep the scope minimal and deterministic.",
+                    "Produce one clearly testable execute entrypoint.",
+                    "Prefer composability over broad one-shot behaviors.",
+                ],
+            )
 
         return {
+            "capability_gaps": capability_gaps,
+            "suggestions": suggestions,
+        }
+
+    async def _trigger_self_reflective_evolution(
+        self,
+        suggestions: List[Dict[str, Any]],
+        *,
+        max_evolution_requests: int,
+    ) -> Dict[str, Any]:
+        """Best-effort promotion of one reflection result into a new evolution request."""
+        summary: Dict[str, Any] = {
+            "requested": True,
+            "triggered": False,
+            "request_count": 0,
+            "requests": [],
+            "skipped": [],
+        }
+
+        request_budget = max(0, int(max_evolution_requests))
+        if request_budget <= 0:
+            summary["requested"] = False
+            return summary
+
+        if request_budget > 1:
+            summary["skipped"].append(
+                {
+                    "reason": "single_inflight_limit",
+                    "detail": "Holon runtime serializes self-evolution to one in-flight request.",
+                }
+            )
+        request_budget = min(1, request_budget)
+
+        known_skills = set()
+        for skill in self.list_skills():
+            skill_id = str(skill.get("skill_id") or "").strip().lower()
+            skill_name = str(skill.get("name") or "").strip().lower()
+            if skill_id:
+                known_skills.add(skill_id)
+            if skill_name:
+                known_skills.add(skill_name)
+
+        for suggestion in suggestions:
+            if summary["request_count"] >= request_budget:
+                break
+
+            if str(suggestion.get("type") or "").strip().lower() != "evolve_skill":
+                summary["skipped"].append(
+                    {
+                        "reason": "non_evolution_action",
+                        "detail": str(suggestion.get("action") or suggestion.get("type") or "").strip(),
+                    }
+                )
+                continue
+
+            suggested_skill = str(suggestion.get("suggested_skill") or "").strip()
+            if not suggested_skill:
+                summary["skipped"].append({"reason": "missing_skill_name"})
+                continue
+            if suggested_skill.lower() in known_skills:
+                summary["skipped"].append(
+                    {
+                        "reason": "skill_already_present",
+                        "skill_name": suggested_skill,
+                    }
+                )
+                continue
+
+            try:
+                request = await self.request_evolution(
+                    skill_name=suggested_skill,
+                    description=str(suggestion.get("description") or suggestion.get("reason") or "").strip(),
+                    requirements=[
+                        str(item).strip()
+                        for item in suggestion.get("requirements", [])
+                        if str(item).strip()
+                    ],
+                )
+            except CapabilityDeniedError as exc:
+                summary["skipped"].append(
+                    {
+                        "reason": "boundary_denied",
+                        "skill_name": suggested_skill,
+                        "detail": str(exc),
+                    }
+                )
+                continue
+            except Exception as exc:
+                logger.warning(
+                    "self_reflection_auto_evolution_failed",
+                    holon_id=self.holon_id,
+                    skill_name=suggested_skill,
+                    error=str(exc),
+                )
+                summary["skipped"].append(
+                    {
+                        "reason": "request_failed",
+                        "skill_name": suggested_skill,
+                        "detail": str(exc),
+                    }
+                )
+                continue
+
+            summary["triggered"] = True
+            summary["request_count"] = 1
+            summary["requests"].append(
+                {
+                    "request_id": request.request_id,
+                    "skill_name": request.skill_name,
+                    "status": request.status.value,
+                }
+            )
+            break
+
+        return summary
+
+    async def self_improve(
+        self,
+        auto_evolve: bool = False,
+        max_suggestions: int = 3,
+        max_evolution_requests: int = 1,
+    ) -> Dict[str, Any]:
+        """Run a durable self-reflection pass and optionally spawn one new evolution."""
+        self._assert_runtime_available(action="self_improve")
+
+        suggestion_limit = max(1, int(max_suggestions))
+        evolution_limit = max(0, int(max_evolution_requests))
+        recent_episodes = await self.memory.get_episodes(limit=100)
+        persisted_skills = self.list_skills()
+        state_payload = self._holon_service.get_holon_state(self.holon_id)
+        latest_audit = state_payload.get("evolution_audit")
+        if not isinstance(latest_audit, dict):
+            latest_audit = {}
+
+        local_requests = list(self._evolution_requests.values())
+        if not recent_episodes and not persisted_skills and not local_requests and not latest_audit:
+            return {
+                "status": "no_data",
+                "metrics": {
+                    "total_episodes": 0,
+                    "success_rate": 0.0,
+                    "failure_patterns": {},
+                    "failure_categories": {},
+                },
+                "capability_gaps": [],
+                "suggestions": [],
+                "auto_evolution": {
+                    "requested": bool(auto_evolve and evolution_limit > 0),
+                    "triggered": False,
+                    "request_count": 0,
+                    "requests": [],
+                    "skipped": [],
+                },
+            }
+
+        total = len(recent_episodes)
+        successes = sum(1 for episode in recent_episodes if episode.get("outcome") == "success")
+        failures = sum(1 for episode in recent_episodes if episode.get("outcome") == "failure")
+        success_rate = float(successes / total) if total > 0 else 0.0
+        avg_latency_ms = int(
+            round(sum(int(episode.get("latency_ms", 0) or 0) for episode in recent_episodes) / total)
+        ) if total > 0 else 0
+        avg_cost = round(
+            sum(float(episode.get("cost", 0.0) or 0.0) for episode in recent_episodes) / total,
+            6,
+        ) if total > 0 else 0.0
+
+        failure_signals = self._collect_failure_signals(recent_episodes, latest_audit)
+        failure_pattern_counter: Counter[str] = Counter(
+            signal["message"]
+            for signal in failure_signals
+            if signal.get("message")
+        )
+        failure_category_counter: Counter[str] = Counter(
+            signal["category"]
+            for signal in failure_signals
+            if signal.get("category")
+        )
+
+        completed_requests = sum(1 for request in local_requests if request.status == EvolutionStatus.COMPLETED)
+        failed_requests = sum(1 for request in local_requests if request.status == EvolutionStatus.FAILED)
+        total_requests = len(local_requests)
+        evolution_success_rate = (
+            float(completed_requests / total_requests)
+            if total_requests > 0
+            else 0.0
+        )
+        adaptation_pressure = round(
+            min(
+                1.0,
+                (float(failures / total) if total > 0 else 0.0)
+                + (0.15 if failed_requests > completed_requests else 0.0)
+                + (0.15 if len(persisted_skills) < 2 else 0.0),
+            ),
+            4,
+        )
+
+        action_plan = self._derive_self_improvement_actions(
+            total_episodes=total,
+            success_rate=success_rate,
+            failures=failures,
+            avg_latency_ms=avg_latency_ms,
+            skill_count=len(persisted_skills),
+            failure_categories=dict(failure_category_counter),
+            max_suggestions=suggestion_limit,
+        )
+
+        summary = (
+            f"Self-reflection: success_rate={success_rate:.1%}, "
+            f"episodes={total}, skills={len(persisted_skills)}, "
+            f"adaptation_pressure={adaptation_pressure:.2f}"
+        )
+        reflection_id = f"reflect_{uuid.uuid4().hex[:12]}"
+        created_at = utc_now_iso()
+
+        reflection: Dict[str, Any] = {
             "status": "analyzed",
+            "reflection_id": reflection_id,
+            "created_at": created_at,
+            "summary": summary,
             "metrics": {
                 "total_episodes": total,
                 "success_rate": success_rate,
-                "failure_patterns": failure_patterns,
+                "failure_patterns": dict(failure_pattern_counter.most_common(5)),
+                "failure_categories": dict(failure_category_counter),
+                "avg_latency_ms": avg_latency_ms,
+                "avg_cost": avg_cost,
+                "persisted_skill_count": len(persisted_skills),
+                "evolution": {
+                    "total_requests": total_requests,
+                    "completed": completed_requests,
+                    "failed": failed_requests,
+                    "success_rate": evolution_success_rate,
+                },
+                "adaptation_pressure": adaptation_pressure,
             },
-            "suggestions": suggestions,
+            "capability_gaps": action_plan["capability_gaps"],
+            "suggestions": action_plan["suggestions"],
+            "auto_evolution": {
+                "requested": bool(auto_evolve and evolution_limit > 0),
+                "triggered": False,
+                "request_count": 0,
+                "requests": [],
+                "skipped": [],
+            },
         }
+
+        if auto_evolve and evolution_limit > 0:
+            reflection["auto_evolution"] = await self._trigger_self_reflective_evolution(
+                reflection["suggestions"],
+                max_evolution_requests=evolution_limit,
+            )
+
+        self.state.performance_metrics = {
+            "reflection_id": reflection_id,
+            "created_at": created_at,
+            **reflection["metrics"],
+        }
+        self._holon_service.record_self_reflection(self.holon_id, reflection)
+
+        await self._safe_remember(
+            content=summary,
+            tags=["self_improvement", "analysis", "reflection"],
+            importance=0.9,
+        )
+
+        return reflection
 
     async def compose_skill(
         self,

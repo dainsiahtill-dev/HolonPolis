@@ -78,6 +78,23 @@ class PredictorHandle:
     llm_evolved: bool
 
 
+@dataclass
+class ReEvolutionJobResult:
+    holon_id: str
+    scheduled_round: int
+    success: bool
+    handle: Optional[PredictorHandle] = None
+    error: str = ""
+
+
+@dataclass
+class ReEvolutionStats:
+    scheduled: int = 0
+    completed: int = 0
+    failed: int = 0
+    llm_evolved: int = 0
+
+
 def _slugify(text: str) -> str:
     normalized = "".join(ch.lower() if ch.isalnum() else "_" for ch in str(text or "").strip())
     while "__" in normalized:
@@ -719,9 +736,48 @@ def _feedback_from_state(state: HolonLeagueState) -> Dict[str, Any]:
     }
 
 
-async def _re_evolve_predictors(
-    round_index: int,
+def _resolve_re_evolve_batch_size(
+    requested_batch_size: Optional[int],
+    total_holons: int,
+    evolution_concurrency: int,
+) -> int:
+    total = max(0, int(total_holons))
+    if total <= 0:
+        return 0
+    if requested_batch_size is None or int(requested_batch_size) <= 0:
+        return min(total, max(1, int(evolution_concurrency)))
+    return min(total, max(1, int(requested_batch_size)))
+
+
+def _select_re_evolve_holons(
     predictors: Dict[str, PredictorHandle],
+    inflight_jobs: Dict[str, asyncio.Task[ReEvolutionJobResult]],
+    cursor: int,
+    batch_size: int,
+) -> tuple[List[str], int]:
+    ordered = sorted(str(hid) for hid in predictors.keys())
+    if not ordered or int(batch_size) <= 0:
+        return [], int(cursor)
+
+    total = len(ordered)
+    index = int(cursor) % total
+    scanned = 0
+    selected: List[str] = []
+    while scanned < total and len(selected) < int(batch_size):
+        holon_id = ordered[index]
+        if holon_id not in inflight_jobs:
+            selected.append(holon_id)
+        index = (index + 1) % total
+        scanned += 1
+    if not selected:
+        return [], int(cursor)
+    return selected, index
+
+
+async def _build_re_evolve_result(
+    holon_id: str,
+    scheduled_round: int,
+    evolution_sem: asyncio.Semaphore,
     scoreboard: Dict[str, HolonLeagueState],
     holon_service: HolonService,
     evo: EvolutionService,
@@ -730,25 +786,18 @@ async def _re_evolve_predictors(
     llm_max_attempts: int,
     llm_outer_retries: int,
     strict_llm_evolution: bool,
-    evolution_concurrency: int,
-) -> Dict[str, PredictorHandle]:
-    _emit_progress(
-        "batch",
-        f"re-evolve { _evolution_phase_label(round_index) } holons={len(predictors)} evolution_concurrency={max(1, int(evolution_concurrency))}",
-    )
-    sem = asyncio.Semaphore(max(1, int(evolution_concurrency)))
-
-    async def _refresh_one(hid: str) -> tuple[str, PredictorHandle]:
-        async with sem:
-            state = scoreboard[hid]
+) -> ReEvolutionJobResult:
+    try:
+        async with evolution_sem:
+            state = scoreboard[holon_id]
             skill_id, code_hash, llm_evolved = await _ensure_skill(
-                holon_id=hid,
+                holon_id=holon_id,
                 holon_service=holon_service,
                 evo=evo,
                 skill_name=skill_name,
                 schema=schema,
                 strategy=dict(state.strategy),
-                round_index=round_index,
+                round_index=scheduled_round,
                 feedback=_feedback_from_state(state),
                 force_evolve=True,
                 require_llm_evolution=True,
@@ -756,25 +805,137 @@ async def _re_evolve_predictors(
                 llm_max_attempts=llm_max_attempts,
                 llm_outer_retries=llm_outer_retries,
             )
-            runtime = HolonRuntime(
-                holon_id=hid,
-                blueprint=holon_service.get_blueprint(hid),
-            )
-            loaded = runtime.get_skill(skill_id)
-            return hid, PredictorHandle(
+        runtime = HolonRuntime(
+            holon_id=holon_id,
+            blueprint=holon_service.get_blueprint(holon_id),
+        )
+        loaded = runtime.get_skill(skill_id)
+        return ReEvolutionJobResult(
+            holon_id=holon_id,
+            scheduled_round=int(scheduled_round),
+            success=True,
+            handle=PredictorHandle(
                 loaded_skill=loaded,
                 skill_id=skill_id,
                 code_hash=code_hash,
                 llm_evolved=llm_evolved,
-            )
+            ),
+        )
+    except Exception as exc:
+        return ReEvolutionJobResult(
+            holon_id=holon_id,
+            scheduled_round=int(scheduled_round),
+            success=False,
+            error=_compact_error_text(exc),
+        )
 
-    refreshed = await asyncio.gather(*(_refresh_one(hid) for hid in predictors.keys()))
-    llm_count = sum(1 for _, handle in refreshed if handle.llm_evolved)
+
+def _schedule_re_evolve_jobs(
+    round_index: int,
+    predictors: Dict[str, PredictorHandle],
+    inflight_jobs: Dict[str, asyncio.Task[ReEvolutionJobResult]],
+    evolution_sem: asyncio.Semaphore,
+    scoreboard: Dict[str, HolonLeagueState],
+    holon_service: HolonService,
+    evo: EvolutionService,
+    skill_name: str,
+    schema: ToolSchema,
+    llm_max_attempts: int,
+    llm_outer_retries: int,
+    strict_llm_evolution: bool,
+    batch_size: int,
+    cursor: int,
+    stats: ReEvolutionStats,
+) -> int:
+    selected, next_cursor = _select_re_evolve_holons(
+        predictors=predictors,
+        inflight_jobs=inflight_jobs,
+        cursor=cursor,
+        batch_size=batch_size,
+    )
+    if not selected:
+        _emit_progress(
+            "batch",
+            f"re-evolve { _evolution_phase_label(round_index) } skipped inflight={len(inflight_jobs)} batch_size={int(batch_size)}",
+        )
+        return int(cursor)
+
+    for holon_id in selected:
+        inflight_jobs[holon_id] = asyncio.create_task(
+            _build_re_evolve_result(
+                holon_id=holon_id,
+                scheduled_round=round_index,
+                evolution_sem=evolution_sem,
+                scoreboard=scoreboard,
+                holon_service=holon_service,
+                evo=evo,
+                skill_name=skill_name,
+                schema=schema,
+                llm_max_attempts=llm_max_attempts,
+                llm_outer_retries=llm_outer_retries,
+                strict_llm_evolution=strict_llm_evolution,
+            )
+        )
+    stats.scheduled += len(selected)
     _emit_progress(
         "batch",
-        f"re-evolve { _evolution_phase_label(round_index) } complete refreshed={len(refreshed)} llm_evolved={llm_count}",
+        f"re-evolve { _evolution_phase_label(round_index) } scheduled={len(selected)} inflight={len(inflight_jobs)} batch_size={int(batch_size)}",
     )
-    return {hid: handle for hid, handle in refreshed}
+    return int(next_cursor)
+
+
+def _apply_re_evolve_result(
+    result: ReEvolutionJobResult,
+    predictors: Dict[str, PredictorHandle],
+    scoreboard: Dict[str, HolonLeagueState],
+    stats: ReEvolutionStats,
+    strict_llm_evolution: bool,
+) -> None:
+    if not result.success or result.handle is None:
+        stats.failed += 1
+        _emit_progress(
+            "evolve",
+            f"{_evolution_phase_label(result.scheduled_round)} {result.holon_id} async-fail reason={result.error}",
+        )
+        if bool(strict_llm_evolution):
+            raise RuntimeError(
+                f"async re-evolve failed holon_id={result.holon_id} round={result.scheduled_round} error={result.error}"
+            )
+        return
+
+    handle = result.handle
+    predictors[result.holon_id] = handle
+    state = scoreboard[result.holon_id]
+    state.skill_id = str(handle.skill_id)
+    state.skill_code_hash = str(handle.code_hash)
+    if handle.llm_evolved:
+        state.llm_evolution_count += 1
+        stats.llm_evolved += 1
+    stats.completed += 1
+    _emit_progress(
+        "evolve",
+        f"{_evolution_phase_label(result.scheduled_round)} {result.holon_id} async-ready skill={handle.skill_id} code={_short_hash(handle.code_hash)} llm={int(bool(handle.llm_evolved))}",
+    )
+
+
+def _drain_re_evolve_jobs(
+    inflight_jobs: Dict[str, asyncio.Task[ReEvolutionJobResult]],
+    predictors: Dict[str, PredictorHandle],
+    scoreboard: Dict[str, HolonLeagueState],
+    stats: ReEvolutionStats,
+    strict_llm_evolution: bool,
+) -> None:
+    completed_ids = [holon_id for holon_id, task in inflight_jobs.items() if task.done()]
+    for holon_id in completed_ids:
+        task = inflight_jobs.pop(holon_id)
+        result = task.result()
+        _apply_re_evolve_result(
+            result=result,
+            predictors=predictors,
+            scoreboard=scoreboard,
+            stats=stats,
+            strict_llm_evolution=strict_llm_evolution,
+        )
 
 
 def _round_delta(hit_count: int, hit3: int, hit2: int, hit1: int, hit0: int) -> int:
@@ -813,8 +974,9 @@ async def run_league(args: argparse.Namespace) -> int:
     if int(args.llm_outer_retries) <= 0:
         raise ValueError("llm_outer_retries must be > 0")
     evolution_concurrency = _resolve_evolution_concurrency(args)
+    llm_re_evolution_enabled = int(args.llm_re_evolve_interval) > 0
     if (
-        (bool(args.require_llm_evolution) or bool(args.force_evolve))
+        (bool(args.require_llm_evolution) or bool(args.force_evolve) or llm_re_evolution_enabled)
         and int(args.population_size) > 1
         and getattr(args, "evolution_concurrency", None) is not None
         and evolution_concurrency < 2
@@ -824,7 +986,7 @@ async def run_league(args: argparse.Namespace) -> int:
         )
 
     llm_provider_info: Dict[str, str] = {}
-    if bool(args.require_llm_evolution) or bool(args.force_evolve):
+    if bool(args.require_llm_evolution) or bool(args.force_evolve) or llm_re_evolution_enabled:
         llm_provider_info = _validate_llm_provider_ready()
         _emit_progress(
             "llm",
@@ -892,8 +1054,32 @@ async def run_league(args: argparse.Namespace) -> int:
             llm_evolution_count=1 if bool(handle.llm_evolved) else 0,
         )
     rounds: List[RoundSummary] = []
+    re_evolve_batch_size = _resolve_re_evolve_batch_size(
+        requested_batch_size=getattr(args, "llm_re_evolve_batch_size", None),
+        total_holons=len(predictors),
+        evolution_concurrency=int(evolution_concurrency),
+    )
+    re_evolve_cursor = 0
+    re_evolve_stats = ReEvolutionStats()
+    inflight_re_evolutions: Dict[str, asyncio.Task[ReEvolutionJobResult]] = {}
+    re_evolve_sem = asyncio.Semaphore(max(1, int(evolution_concurrency)))
+    if int(args.llm_re_evolve_interval) > 0:
+        _emit_progress(
+            "batch",
+            "re-evolve mode="
+            f"async interval={int(args.llm_re_evolve_interval)} "
+            f"batch_size={int(re_evolve_batch_size)} "
+            f"evolution_concurrency={int(evolution_concurrency)}",
+        )
 
     for round_index in range(1, int(args.rounds) + 1):
+        _drain_re_evolve_jobs(
+            inflight_jobs=inflight_re_evolutions,
+            predictors=predictors,
+            scoreboard=scoreboard,
+            stats=re_evolve_stats,
+            strict_llm_evolution=bool(args.strict_llm_evolution),
+        )
         target = predict_rows[(round_index - 1) % len(predict_rows)]
         truth = set(int(v) for v in target["numbers"])
         sem = asyncio.Semaphore(max(1, int(args.concurrency)))
@@ -997,9 +1183,11 @@ async def run_league(args: argparse.Namespace) -> int:
             state.evolution_step += 1
 
         if int(args.llm_re_evolve_interval) > 0 and round_index % int(args.llm_re_evolve_interval) == 0:
-            predictors = await _re_evolve_predictors(
+            re_evolve_cursor = _schedule_re_evolve_jobs(
                 round_index=round_index,
                 predictors=predictors,
+                inflight_jobs=inflight_re_evolutions,
+                evolution_sem=re_evolve_sem,
                 scoreboard=scoreboard,
                 holon_service=holon_service,
                 evo=evo,
@@ -1008,14 +1196,10 @@ async def run_league(args: argparse.Namespace) -> int:
                 llm_max_attempts=int(args.llm_max_attempts),
                 llm_outer_retries=int(args.llm_outer_retries),
                 strict_llm_evolution=bool(args.strict_llm_evolution),
-                evolution_concurrency=int(evolution_concurrency),
+                batch_size=int(re_evolve_batch_size),
+                cursor=int(re_evolve_cursor),
+                stats=re_evolve_stats,
             )
-            for hid, handle in predictors.items():
-                state = scoreboard[hid]
-                state.skill_id = str(handle.skill_id)
-                state.skill_code_hash = str(handle.code_hash)
-                if handle.llm_evolved:
-                    state.llm_evolution_count += 1
 
         ranked_round = sorted(per_round, key=lambda item: (-item.points, -item.round_hits, item.holon_id))
         rounds.append(
@@ -1028,6 +1212,20 @@ async def run_league(args: argparse.Namespace) -> int:
         print(
             f"[round {round_index}/{args.rounds}] draw={target['draw_id']} "
             f"leader={ranked_round[0].holon_id} points={ranked_round[0].points}"
+        )
+
+    if inflight_re_evolutions:
+        _emit_progress(
+            "batch",
+            f"await final re-evolve inflight={len(inflight_re_evolutions)}",
+        )
+        await asyncio.gather(*inflight_re_evolutions.values())
+        _drain_re_evolve_jobs(
+            inflight_jobs=inflight_re_evolutions,
+            predictors=predictors,
+            scoreboard=scoreboard,
+            stats=re_evolve_stats,
+            strict_llm_evolution=bool(args.strict_llm_evolution),
         )
 
     final_rank = sorted(
@@ -1059,12 +1257,14 @@ async def run_league(args: argparse.Namespace) -> int:
             "llm_max_attempts": int(args.llm_max_attempts),
             "llm_outer_retries": int(args.llm_outer_retries),
             "llm_re_evolve_interval": int(args.llm_re_evolve_interval),
+            "llm_re_evolve_batch_size": int(re_evolve_batch_size),
             "concurrency": int(args.concurrency),
             "evolution_concurrency": int(evolution_concurrency),
             "mentor_top_k": int(args.mentor_top_k),
             "mentor_adopt_rate": float(args.mentor_adopt_rate),
             "llm_provider": llm_provider_info,
         },
+        "llm_re_evolution": asdict(re_evolve_stats),
         "skill_diversity": _skill_diversity_summary(scoreboard),
         "rounds": [
             {
@@ -1145,6 +1345,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-max-attempts", type=int, default=6)
     parser.add_argument("--llm-outer-retries", type=int, default=3)
     parser.add_argument("--llm-re-evolve-interval", type=int, default=20)
+    parser.add_argument("--llm-re-evolve-batch-size", type=int, default=None)
     parser.add_argument(
         "--output-json",
         default=r"C:\Temp\holonpolis_stress\holon_points_league_100r.json",

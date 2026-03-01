@@ -11,6 +11,7 @@ from holonpolis.kernel.embeddings.default_embedder import SimpleEmbedder, set_em
 from holonpolis.kernel.lancedb import reset_factory
 from holonpolis.runtime.holon_runtime import (
     CapabilityDeniedError,
+    EvolutionRequest,
     EvolutionStatus,
     HolonRuntime,
     SkillPayloadValidationError,
@@ -200,7 +201,7 @@ async def test_runtime_evolution_status_survives_genesis_audit_failure(runtime_s
     await HolonService().create_holon(blueprint)
     runtime = HolonRuntime(holon_id=holon_id, blueprint=blueprint)
 
-    async def fake_generate_tests(self, skill_name, description, requirements):
+    async def fake_generate_tests(self, *args, **kwargs):
         return """
 from skill_module import execute
 
@@ -208,7 +209,7 @@ def test_execute():
     assert execute(2, 3) == 5
 """
 
-    async def fake_generate_code(self, skill_name, description, requirements, tests):
+    async def fake_generate_code(self, *args, **kwargs):
         return """
 def execute(a, b):
     return a + b
@@ -283,6 +284,12 @@ def test_execute():
         await gate.wait()
         request.status = EvolutionStatus.FAILED
         request.error_message = "cancelled_for_test"
+        request.completed_at = "2026-03-01T00:00:00+00:00"
+        self._holon_service.mark_active(
+            self.holon_id,
+            reason="test_pending_released",
+            details={"service": "test_runtime_capabilities", "request_id": request.request_id},
+        )
 
     monkeypatch.setattr(HolonRuntime, "_execute_evolution", fake_execute_evolution)
 
@@ -342,6 +349,83 @@ async def test_failed_evolution_produces_next_round_plan(runtime_setup, monkeypa
     assert status.result["retry_recommended"] is True
     assert status.result["next_round_plan"]["focus"] == "stabilize_execution"
     assert "revised_requirements" in status.result["next_round_plan"]
+
+
+@pytest.mark.asyncio
+async def test_self_improve_persists_reflection_and_auto_evolves_once(runtime_setup, monkeypatch):
+    """Self-reflection should persist structured telemetry and turn top insights into one evolution."""
+    holon_id = "runtime_self_improve"
+    blueprint = _blueprint(holon_id)
+    await HolonService().create_holon(blueprint)
+    runtime = HolonRuntime(holon_id=holon_id, blueprint=blueprint)
+
+    await runtime.memory.write_episode(
+        transcript=[{"role": "user", "content": "normalize payload"}],
+        outcome="failure",
+        outcome_details={"error": "payload missing required field email"},
+        latency_ms=140,
+    )
+    await runtime.memory.write_episode(
+        transcript=[{"role": "user", "content": "validate payload"}],
+        outcome="failure",
+        outcome_details={"error": "payload missing required field email"},
+        latency_ms=120,
+    )
+    await runtime.memory.write_episode(
+        transcript=[{"role": "user", "content": "ping"}],
+        outcome="success",
+        latency_ms=80,
+    )
+
+    triggered: list[dict[str, object]] = []
+
+    async def fake_request_evolution(
+        *,
+        skill_name,
+        description,
+        requirements,
+        test_cases=None,
+        parent_skills=None,
+    ):
+        triggered.append(
+            {
+                "skill_name": skill_name,
+                "description": description,
+                "requirements": list(requirements),
+            }
+        )
+        return EvolutionRequest(
+            request_id="evo_self_reflect_001",
+            holon_id=holon_id,
+            skill_name=skill_name,
+            description=description,
+            requirements=list(requirements),
+            test_cases=list(test_cases or []),
+            parent_skills=list(parent_skills or []),
+            status=EvolutionStatus.PENDING,
+            created_at="2026-03-01T00:00:00+00:00",
+        )
+
+    monkeypatch.setattr(runtime, "request_evolution", fake_request_evolution)
+
+    result = await runtime.self_improve(
+        auto_evolve=True,
+        max_suggestions=3,
+        max_evolution_requests=1,
+    )
+
+    assert result["status"] == "analyzed"
+    assert result["metrics"]["failure_categories"]["contract"] >= 2
+    assert any(gap["gap_id"] == "input_contracts" for gap in result["capability_gaps"])
+    assert result["auto_evolution"]["triggered"] is True
+    assert result["auto_evolution"]["request_count"] == 1
+    assert triggered[0]["skill_name"] == "input_contract_guard"
+
+    state = HolonService().get_holon_state(holon_id)
+    reflection = state.get("self_reflection")
+    assert isinstance(reflection, dict)
+    assert reflection["latest_reflection_id"] == result["reflection_id"]
+    assert reflection["history"][0]["reflection_id"] == result["reflection_id"]
 
 
 @pytest.mark.asyncio

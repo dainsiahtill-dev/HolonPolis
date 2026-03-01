@@ -185,6 +185,24 @@ class SkillExecuteRequest(BaseModel):
     }
 
 
+class SelfImproveRequest(BaseModel):
+    """Request body for running self-reflection and optional auto-evolution."""
+
+    auto_evolve: bool = False
+    max_suggestions: int = Field(default=3, ge=1, le=10)
+    max_evolution_requests: int = Field(default=1, ge=0, le=1)
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "auto_evolve": True,
+                "max_suggestions": 3,
+                "max_evolution_requests": 1,
+            }
+        }
+    }
+
+
 class OfferSkillRequest(BaseModel):
     """Request body for publishing a skill offer to marketplace."""
 
@@ -464,6 +482,39 @@ async def get_evolution_status(
         "result": _to_json_safe(status.result),
         "error_message": status.error_message,
     }
+
+
+@router.post(
+    "/{holon_id}/self-improve",
+    responses={
+        403: ERROR_403_FORBIDDEN,
+        404: ERROR_404_HOLON,
+        422: ERROR_422_PAYLOAD,
+    },
+)
+async def self_improve_holon(
+    holon_id: str,
+    request: SelfImproveRequest,
+    manager: HolonManager = Depends(get_holon_manager_dep),
+) -> Dict[str, Any]:
+    """Run a Holon's self-reflection cycle and optionally trigger one evolution."""
+    runtime = _get_runtime(holon_id, manager)
+    _enforce_capability(
+        runtime,
+        "evolution.self_improve",
+        aliases=["self_improve", "reflect"],
+    )
+    try:
+        result = await runtime.self_improve(
+            auto_evolve=request.auto_evolve,
+            max_suggestions=request.max_suggestions,
+            max_evolution_requests=request.max_evolution_requests,
+        )
+    except HolonUnavailableError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except CapabilityDeniedError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    return _to_json_safe(result)
 
 
 @router.get(

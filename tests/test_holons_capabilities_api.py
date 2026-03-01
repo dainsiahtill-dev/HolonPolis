@@ -170,6 +170,53 @@ def test_evolution_request_and_status_endpoints(client, created_holon, monkeypat
     assert data["result"]["skill_id"] == "planner_skill"
 
 
+def test_self_improve_endpoint_returns_reflection_snapshot(client, created_holon, monkeypatch):
+    manager = get_holon_manager()
+    runtime = manager.get_runtime(created_holon)
+
+    async def fake_self_improve(auto_evolve=False, max_suggestions=3, max_evolution_requests=1):
+        assert auto_evolve is True
+        assert max_suggestions == 2
+        assert max_evolution_requests == 1
+        return {
+            "status": "analyzed",
+            "reflection_id": "reflect_001",
+            "metrics": {
+                "total_episodes": 4,
+                "success_rate": 0.5,
+                "failure_patterns": {"payload missing required field email": 2},
+                "failure_categories": {"contract": 2},
+            },
+            "capability_gaps": [{"gap_id": "input_contracts", "severity": "high"}],
+            "suggestions": [{"type": "evolve_skill", "suggested_skill": "input_contract_guard"}],
+            "auto_evolution": {
+                "requested": True,
+                "triggered": True,
+                "request_count": 1,
+                "requests": [{"request_id": "evo_001", "skill_name": "input_contract_guard"}],
+                "skipped": [],
+            },
+        }
+
+    monkeypatch.setattr(runtime, "self_improve", fake_self_improve)
+
+    response = client.post(
+        f"/api/v1/holons/{created_holon}/self-improve",
+        json={
+            "auto_evolve": True,
+            "max_suggestions": 2,
+            "max_evolution_requests": 1,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "analyzed"
+    assert payload["reflection_id"] == "reflect_001"
+    assert payload["auto_evolution"]["triggered"] is True
+    assert payload["suggestions"][0]["suggested_skill"] == "input_contract_guard"
+
+
 def test_social_and_market_endpoints(client, created_holon, monkeypatch):
     manager = get_holon_manager()
     runtime = manager.get_runtime(created_holon)

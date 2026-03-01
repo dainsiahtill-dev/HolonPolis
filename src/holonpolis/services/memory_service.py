@@ -317,17 +317,55 @@ class MemoryService:
             # Just get all, ordered by time (LanceDB doesn't guarantee order without index)
             results = table.search().limit(limit).to_list()
 
-        return [
-            {
-                "episode_id": r["episode_id"],
-                "outcome": r["outcome"],
-                "cost": r["cost"],
-                "latency_ms": r["latency_ms"],
-                "evolution_id": r["evolution_id"],
-                "started_at": r["started_at"],
-            }
-            for r in results
-        ]
+        episodes: List[Dict[str, Any]] = []
+        for record in results:
+            transcript = record.get("transcript", [])
+            if isinstance(transcript, str):
+                try:
+                    transcript = json.loads(transcript)
+                except Exception:
+                    transcript = []
+            if not isinstance(transcript, list):
+                transcript = []
+
+            tool_chain = record.get("tool_chain", [])
+            if isinstance(tool_chain, str):
+                try:
+                    tool_chain = json.loads(tool_chain)
+                except Exception:
+                    tool_chain = []
+            if not isinstance(tool_chain, list):
+                tool_chain = []
+
+            outcome_details = record.get("outcome_details", {})
+            if isinstance(outcome_details, str):
+                try:
+                    outcome_details = json.loads(outcome_details)
+                except Exception:
+                    outcome_details = {}
+            if not isinstance(outcome_details, dict):
+                outcome_details = {}
+
+            episodes.append(
+                {
+                    "episode_id": record["episode_id"],
+                    "transcript": transcript,
+                    "tool_chain": tool_chain,
+                    "outcome": record["outcome"],
+                    "outcome_details": outcome_details,
+                    "cost": record["cost"],
+                    "latency_ms": record["latency_ms"],
+                    "evolution_id": record["evolution_id"],
+                    "started_at": record["started_at"],
+                    "ended_at": record.get("ended_at"),
+                }
+            )
+
+        episodes.sort(
+            key=lambda item: item.get("ended_at") or item.get("started_at") or "",
+            reverse=True,
+        )
+        return episodes[:limit]
 
     async def hybrid_search(
         self,

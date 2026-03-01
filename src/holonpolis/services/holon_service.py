@@ -186,6 +186,56 @@ class HolonService:
         existing["evolution_audit"] = audit
         return self._write_state(holon_id, existing)
 
+    def record_self_reflection(
+        self,
+        holon_id: str,
+        snapshot: Optional[Dict[str, Any]] = None,
+        *,
+        max_history: int = 10,
+    ) -> Dict[str, Any]:
+        """Persist the latest self-reflection snapshot with bounded history."""
+        existing = self._read_state(holon_id)
+        reflection = existing.get("self_reflection")
+        if not isinstance(reflection, dict):
+            reflection = {}
+
+        history = reflection.get("history")
+        if not isinstance(history, list):
+            history = []
+
+        snapshot_payload = dict(snapshot or {})
+        reflection_id = str(snapshot_payload.get("reflection_id") or "").strip()
+        created_at = str(snapshot_payload.get("created_at") or utc_now_iso()).strip()
+
+        history_entry = {
+            "reflection_id": reflection_id,
+            "created_at": created_at,
+            "summary": str(snapshot_payload.get("summary") or "").strip(),
+            "metrics": snapshot_payload.get("metrics", {}),
+            "capability_gaps": snapshot_payload.get("capability_gaps", []),
+            "suggestions": snapshot_payload.get("suggestions", []),
+            "auto_evolution": snapshot_payload.get("auto_evolution", {}),
+        }
+
+        bounded_history = [history_entry]
+        for item in history:
+            if not isinstance(item, dict):
+                continue
+            if item.get("reflection_id") == reflection_id and reflection_id:
+                continue
+            bounded_history.append(item)
+            if len(bounded_history) >= max(1, int(max_history)):
+                break
+
+        reflection = _deep_merge_dicts(reflection, snapshot_payload)
+        reflection["latest_reflection_id"] = reflection_id
+        reflection["latest_created_at"] = created_at
+        reflection["history"] = bounded_history
+        reflection["updated_at"] = utc_now_iso()
+
+        existing["self_reflection"] = reflection
+        return self._write_state(holon_id, existing)
+
     def is_pending(self, holon_id: str) -> bool:
         """Check if a Holon is pending."""
         return self.get_holon_status(holon_id) == _STATUS_PENDING
